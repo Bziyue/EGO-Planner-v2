@@ -899,6 +899,53 @@ namespace ego_planner
       }
     }
 
+    // Optional debug: verify PolyTraj message encoding matches internal trajectory.
+    {
+      bool check_poly_msg = false;
+      ros::param::param("debug/check_poly_msg", check_poly_msg, false);
+      if (check_poly_msg)
+      {
+        const int num_coeffs = 6;
+        std::vector<double> breakpoints(piece_num + 1);
+        breakpoints[0] = 0.0;
+        for (int i = 0; i < piece_num; ++i)
+          breakpoints[i + 1] = breakpoints[i] + poly_msg.duration[i];
+
+        using MatrixType = Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor>;
+        MatrixType coefficients(piece_num * num_coeffs, 3);
+        for (int i = 0; i < piece_num; ++i)
+        {
+          int i6 = i * 6;
+          for (int j = 0; j < 6; ++j)
+          {
+            coefficients(i * num_coeffs + j, 0) = poly_msg.coef_x[i6 + j];
+            coefficients(i * num_coeffs + j, 1) = poly_msg.coef_y[i6 + j];
+            coefficients(i * num_coeffs + j, 2) = poly_msg.coef_z[i6 + j];
+          }
+        }
+
+        PPoly3D msg_traj(breakpoints, coefficients, num_coeffs);
+        double t0 = data->traj.getStartTime();
+        double t1 = data->traj.getEndTime();
+        double max_dev = 0.0;
+        const int samples = 50;
+        for (int i = 0; i <= samples; ++i)
+        {
+          double s = static_cast<double>(i) / samples;
+          double t = t0 + (t1 - t0) * s;
+          Eigen::Vector3d p_ref = data->traj.evaluate(t, SplineTrajectory::Deriv::Pos);
+          Eigen::Vector3d p_msg = msg_traj.evaluate(t, SplineTrajectory::Deriv::Pos);
+          double d = (p_ref - p_msg).norm();
+          if (d > max_dev)
+            max_dev = d;
+        }
+
+        ROS_WARN_STREAM("[poly_msg_check] drone=" << planner_manager_->pp_.drone_id
+                                                    << " max_dev=" << max_dev
+                                                    << " piece_num=" << piece_num);
+      }
+    }
+
     MINCO_msg.drone_id = planner_manager_->pp_.drone_id;
     MINCO_msg.traj_id = data->traj_id;
     MINCO_msg.start_time = ros::Time(data->start_time);
