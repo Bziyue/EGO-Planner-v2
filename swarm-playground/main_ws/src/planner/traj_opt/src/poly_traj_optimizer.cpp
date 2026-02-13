@@ -114,9 +114,6 @@ namespace ego_planner
       flag_success = false;
       flag_swarm_too_close = false;
 
-      // Reset variance gradient for fresh optimization
-      integral_cost_func_.has_variance_grad_ = false;
-
       // Update swarm weight for retry
       integral_cost_func_.wei_swarm = wei_swarm_mod_;
 

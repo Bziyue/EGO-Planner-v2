@@ -1,6 +1,10 @@
 #include <plan_manage/planner_manager.h>
 #include <thread>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
 #include "visualization_msgs/Marker.h"
+#include "optimizer/poly_traj_utils.hpp"
 
 namespace ego_planner
 {
@@ -84,6 +88,108 @@ namespace ego_planner
     return maxVel;
   }
 
+  static void appendCompareLog(const std::string &line)
+  {
+    std::string path;
+    ros::param::param("debug/compare_log_path", path, std::string("/tmp/ego_compare.log"));
+    std::ofstream ofs(path, std::ios::app);
+    if (ofs.is_open())
+      ofs << line << std::endl;
+  }
+
+  // Helper: compare a spline trajectory with MinJerkOpt using the same waypoints/durations
+  static void compareTrajWithMinJerk(const PPoly3D &traj,
+                                     const Eigen::VectorXd &durations,
+                                     int K,
+                                     int drone_id,
+                                     const char *tag)
+  {
+    if (durations.size() <= 0)
+      return;
+
+    const int N = traj.getNumSegments();
+    if (N != durations.size())
+    {
+      std::ostringstream ss;
+      ss << "[compare_" << tag << "] t=" << ros::Time::now().toSec()
+         << " drone=" << drone_id
+         << " segment_mismatch traj=" << N << " durs=" << durations.size();
+      appendCompareLog(ss.str());
+      return;
+    }
+
+    Eigen::Matrix<double, 3, 3> headState, tailState;
+    double t0 = traj.getStartTime();
+    double t1 = traj.getEndTime();
+    headState << traj.evaluate(t0, SplineTrajectory::Deriv::Pos),
+        traj.evaluate(t0, SplineTrajectory::Deriv::Vel),
+        traj.evaluate(t0, SplineTrajectory::Deriv::Acc);
+    tailState << traj.evaluate(t1, SplineTrajectory::Deriv::Pos),
+        traj.evaluate(t1, SplineTrajectory::Deriv::Vel),
+        traj.evaluate(t1, SplineTrajectory::Deriv::Acc);
+
+    Eigen::MatrixXd innerPts(3, std::max(0, N - 1));
+    if (N > 1)
+    {
+      const auto &bp = traj.getBreakpoints();
+      for (int i = 0; i < N - 1; ++i)
+      {
+        innerPts.col(i) = traj.evaluate(bp[i + 1], SplineTrajectory::Deriv::Pos);
+      }
+    }
+
+    poly_traj::MinJerkOpt mjo;
+    mjo.reset(headState, tailState, N);
+    mjo.generate(innerPts, durations);
+
+    Eigen::MatrixXd cps_minco = mjo.getInitConstraintPoints(K);
+
+    // Sample spline constraint points
+    Eigen::MatrixXd cps_spline(3, N * K + 1);
+    int idx = 0;
+    double t_accum = traj.getStartTime();
+    const auto &bp = traj.getBreakpoints();
+    for (int i = 0; i < N; ++i)
+    {
+      double dur = bp[i + 1] - bp[i];
+      double step = dur / K;
+      for (int j = 0; j <= K; ++j)
+      {
+        double t = t_accum + step * j;
+        cps_spline.col(idx) = traj.evaluate(t, SplineTrajectory::Deriv::Pos);
+        if (j != K || (j == K && i == N - 1))
+          ++idx;
+      }
+      t_accum += dur;
+    }
+
+    if (cps_minco.cols() != cps_spline.cols())
+    {
+      std::ostringstream ss;
+      ss << "[compare_" << tag << "] t=" << ros::Time::now().toSec()
+         << " drone=" << drone_id
+         << " cps_mismatch minco=" << cps_minco.cols()
+         << " spline=" << cps_spline.cols();
+      appendCompareLog(ss.str());
+      return;
+    }
+
+    double max_dev = 0.0;
+    for (int i = 0; i < cps_minco.cols(); ++i)
+    {
+      double d = (cps_minco.col(i) - cps_spline.col(i)).norm();
+      if (d > max_dev)
+        max_dev = d;
+    }
+    std::ostringstream ss;
+    ss.setf(std::ios::fixed);
+    ss << "[compare_" << tag << "] t=" << ros::Time::now().toSec()
+       << " drone=" << drone_id
+       << " max_dev=" << std::setprecision(6) << max_dev
+       << " cols=" << cps_minco.cols();
+    appendCompareLog(ss.str());
+  }
+
   bool EGOPlannerManager::reboundReplan(
       const Eigen::Vector3d &start_pt, const Eigen::Vector3d &start_vel,
       const Eigen::Vector3d &start_acc, const Eigen::Vector3d &local_target_pt,
@@ -110,6 +216,72 @@ namespace ego_planner
                           initTraj, innerPts, durations, headState, tailState))
     {
       return false;
+    }
+
+    // Optional debug: compare init trajectory with MinJerkOpt for the same inputs
+    {
+      bool debug_compare_init = false;
+      ros::param::param("debug/compare_init_traj", debug_compare_init, false);
+      if (debug_compare_init)
+      {
+        Eigen::Vector3d dir = local_target_pt - start_pt;
+        double dir_norm = dir.norm();
+        if (dir_norm > 1e-6)
+        {
+          dir /= dir_norm;
+          double sv_par = start_vel.dot(dir);
+          double lv_par = local_target_vel.dot(dir);
+          double sv_norm = start_vel.norm();
+          double lv_norm = local_target_vel.norm();
+          double sv_perp = std::sqrt(std::max(0.0, sv_norm * sv_norm - sv_par * sv_par));
+          double lv_perp = std::sqrt(std::max(0.0, lv_norm * lv_norm - lv_par * lv_par));
+
+          std::ostringstream ss;
+          ss.setf(std::ios::fixed);
+          ss << "[compare_init_traj] t=" << ros::Time::now().toSec()
+             << " drone=" << pp_.drone_id
+             << " dir_norm=" << std::setprecision(3) << dir_norm
+             << " sv_par=" << std::setprecision(3) << sv_par
+             << " sv_perp=" << std::setprecision(3) << sv_perp
+             << " sv_norm=" << std::setprecision(3) << sv_norm
+             << " lv_par=" << std::setprecision(3) << lv_par
+             << " lv_perp=" << std::setprecision(3) << lv_perp
+             << " lv_norm=" << std::setprecision(3) << lv_norm;
+          appendCompareLog(ss.str());
+        }
+
+        poly_traj::MinJerkOpt mjo;
+        mjo.reset(headState, tailState, durations.size());
+        mjo.generate(innerPts, durations);
+        Eigen::MatrixXd cps_minco = mjo.getInitConstraintPoints(ploy_traj_opt_->get_cps_num_prePiece_());
+        Eigen::MatrixXd cps_spline = ploy_traj_opt_->getInitConstraintPoints(initTraj, durations, ploy_traj_opt_->get_cps_num_prePiece_());
+        if (cps_minco.cols() == cps_spline.cols())
+        {
+          double max_dev = 0.0;
+          for (int i = 0; i < cps_minco.cols(); ++i)
+          {
+            double d = (cps_minco.col(i) - cps_spline.col(i)).norm();
+            if (d > max_dev)
+              max_dev = d;
+          }
+          std::ostringstream ss;
+          ss.setf(std::ios::fixed);
+          ss << "[compare_init_traj] t=" << ros::Time::now().toSec()
+             << " drone=" << pp_.drone_id
+             << " max_dev=" << std::setprecision(6) << max_dev
+             << " cols=" << cps_minco.cols();
+          appendCompareLog(ss.str());
+        }
+        else
+        {
+          std::ostringstream ss;
+          ss << "[compare_init_traj] t=" << ros::Time::now().toSec()
+             << " drone=" << pp_.drone_id
+             << " size_mismatch minco=" << cps_minco.cols()
+             << " spline=" << cps_spline.cols();
+          appendCompareLog(ss.str());
+        }
+      }
     }
 
     Eigen::MatrixXd cstr_pts = ploy_traj_opt_->getInitConstraintPoints(initTraj, durations, ploy_traj_opt_->get_cps_num_prePiece_());
@@ -191,6 +363,13 @@ namespace ego_planner
         setLocalTrajFromOpt(best_traj, best_durations, touch_goal);
         cstr_pts = ploy_traj_opt_->getInitConstraintPoints(best_traj, best_durations, ploy_traj_opt_->get_cps_num_prePiece_());
         visualization_->displayOptimalList(cstr_pts, 0);
+
+        bool debug_compare_opt = false;
+        ros::param::param("debug/compare_opt_traj", debug_compare_opt, false);
+        if (debug_compare_opt)
+        {
+          compareTrajWithMinJerk(best_traj, best_durations, ploy_traj_opt_->get_cps_num_prePiece_(), pp_.drone_id, "opt_traj");
+        }
       }
     }
     else
@@ -211,6 +390,13 @@ namespace ego_planner
           setLocalTrajFromOpt(opt_traj, opt_durs, touch_goal);
           cstr_pts = ploy_traj_opt_->getInitConstraintPoints(opt_traj, opt_durs, ploy_traj_opt_->get_cps_num_prePiece_());
           visualization_->displayOptimalList(cstr_pts, 0);
+
+          bool debug_compare_opt = false;
+          ros::param::param("debug/compare_opt_traj", debug_compare_opt, false);
+          if (debug_compare_opt)
+          {
+            compareTrajWithMinJerk(opt_traj, opt_durs, ploy_traj_opt_->get_cps_num_prePiece_(), pp_.drone_id, "opt_traj");
+          }
         }
       }
     }
@@ -254,6 +440,84 @@ namespace ego_planner
   {
     static bool flag_first_call = true;
 
+    auto apply_boundary_debug = [&](Eigen::Matrix<double, 3, 3> &head,
+                                    Eigen::Matrix<double, 3, 3> &tail)
+    {
+      bool force_zero = false;
+      bool force_project = false;
+      bool force_cap = false;
+      ros::param::param("debug/force_zero_boundary_vel", force_zero, false);
+      ros::param::param("debug/force_project_boundary_vel", force_project, false);
+      ros::param::param("debug/force_cap_boundary_vel", force_cap, false);
+      if (!force_zero && !force_project && !force_cap)
+        return;
+
+      Eigen::Vector3d dir = local_target_pt - start_pt;
+      double dn = dir.norm();
+      if (dn < 1e-6)
+        return;
+      dir /= dn;
+
+      if (force_zero)
+      {
+        head.col(1).setZero();
+        tail.col(1).setZero();
+      }
+      if (force_project)
+      {
+        head.col(1) = dir * head.col(1).dot(dir);
+        tail.col(1) = dir * tail.col(1).dot(dir);
+      }
+      if (force_cap)
+      {
+        double max_v = pp_.max_vel_;
+        double hv = head.col(1).norm();
+        double tv = tail.col(1).norm();
+        if (max_v > 0)
+        {
+          if (hv > max_v && hv > 1e-6)
+            head.col(1) *= (max_v / hv);
+          if (tv > max_v && tv > 1e-6)
+            tail.col(1) *= (max_v / tv);
+        }
+      }
+
+      std::ostringstream ss;
+      ss << "[compare_init_traj] t=" << ros::Time::now().toSec()
+         << " drone=" << pp_.drone_id
+         << " boundary_override"
+         << " zero=" << (force_zero ? 1 : 0)
+         << " proj=" << (force_project ? 1 : 0)
+         << " cap=" << (force_cap ? 1 : 0);
+      appendCompareLog(ss.str());
+    };
+
+    auto log_init_summary = [&](const char *tag,
+                                const Eigen::Matrix<double, 3, 3> &head,
+                                const Eigen::Matrix<double, 3, 3> &tail,
+                                double dist, int piece_nums, double ts_val)
+    {
+      bool enable = false;
+      ros::param::param("debug/log_init_summary", enable, false);
+      if (!enable)
+        return;
+
+      std::ostringstream ss;
+      ss.setf(std::ios::fixed);
+      ss << "[init_summary] t=" << ros::Time::now().toSec()
+         << " drone=" << pp_.drone_id
+         << " tag=" << tag
+         << " dist=" << std::setprecision(3) << dist
+         << " piece_nums=" << piece_nums
+         << " ts=" << std::setprecision(3) << ts_val
+         << " start_p=(" << head(0, 0) << "," << head(1, 0) << "," << head(2, 0) << ")"
+         << " target_p=(" << tail(0, 0) << "," << tail(1, 0) << "," << tail(2, 0) << ")"
+         << " start_v_norm=" << std::setprecision(3) << head.col(1).norm()
+         << " target_v_norm=" << std::setprecision(3) << tail.col(1).norm()
+         << " start_a_norm=" << std::setprecision(3) << head.col(2).norm();
+      appendCompareLog(ss.str());
+    };
+
     if (flag_first_call || flag_polyInit)
     {
       flag_first_call = false;
@@ -264,6 +528,7 @@ namespace ego_planner
       constexpr double init_of_init_totaldur = 2.0;
       headState << start_pt, start_vel, start_acc;
       tailState << local_target_pt, local_target_vel, Eigen::Vector3d::Zero();
+      apply_boundary_debug(headState, tailState);
 
       if (!flag_randomPolyTraj)
       {
@@ -292,27 +557,15 @@ namespace ego_planner
       // Generate init of init trajectory
       PPoly3D initOfInitTraj = generateSplineTraj(headState, tailState, innerPs, piece_dur_vec);
 
-      // DEBUG: verify initOfInitTraj
-      ROS_INFO("[DEBUG] initOfInitTraj: numSegs=%d, startT=%.4f, endT=%.4f, dur=%.4f",
-               initOfInitTraj.getNumSegments(), initOfInitTraj.getStartTime(),
-               initOfInitTraj.getEndTime(), initOfInitTraj.getDuration());
-      {
-        Eigen::Vector3d p0 = initOfInitTraj.evaluate(initOfInitTraj.getStartTime(), SplineTrajectory::Deriv::Pos);
-        Eigen::Vector3d p1 = initOfInitTraj.evaluate(initOfInitTraj.getEndTime(), SplineTrajectory::Deriv::Pos);
-        ROS_INFO("[DEBUG] initOfInit startPos=(%.3f,%.3f,%.3f), endPos=(%.3f,%.3f,%.3f)",
-                 p0.x(), p0.y(), p0.z(), p1.x(), p1.y(), p1.z());
-        ROS_INFO("[DEBUG] headState.col(0)=(%.3f,%.3f,%.3f), tailState.col(0)=(%.3f,%.3f,%.3f)",
-                 headState(0,0), headState(1,0), headState(2,0),
-                 tailState(0,0), tailState(1,0), tailState(2,0));
-      }
-
       // Generate the real init trajectory
-      piece_nums = round((headState.col(0) - tailState.col(0)).norm() / pp_.polyTraj_piece_length);
+      double dist = (headState.col(0) - tailState.col(0)).norm();
+      piece_nums = round(dist / pp_.polyTraj_piece_length);
       if (piece_nums < 2)
         piece_nums = 2;
       double piece_dur = init_of_init_totaldur / (double)piece_nums;
       piece_dur_vec.resize(piece_nums);
       piece_dur_vec = Eigen::VectorXd::Constant(piece_nums, ts);
+      log_init_summary("poly_init", headState, tailState, dist, piece_nums, ts);
       innerPs.resize(3, piece_nums - 1);
       int id = 0;
       double t_s = piece_dur, t_e = init_of_init_totaldur - piece_dur / 2;
@@ -328,24 +581,6 @@ namespace ego_planner
       }
 
       initTraj = generateSplineTraj(headState, tailState, innerPs, piece_dur_vec);
-
-      // DEBUG: verify initTraj (first-call path)
-      ROS_INFO("[DEBUG] initTraj: numSegs=%d, startT=%.4f, endT=%.4f, dur=%.4f",
-               initTraj.getNumSegments(), initTraj.getStartTime(),
-               initTraj.getEndTime(), initTraj.getDuration());
-      {
-        Eigen::Vector3d p0 = initTraj.evaluate(initTraj.getStartTime(), SplineTrajectory::Deriv::Pos);
-        Eigen::Vector3d pe = initTraj.evaluate(initTraj.getEndTime(), SplineTrajectory::Deriv::Pos);
-        ROS_INFO("[DEBUG] initTraj startPos=(%.3f,%.3f,%.3f), endPos=(%.3f,%.3f,%.3f)",
-                 p0.x(), p0.y(), p0.z(), pe.x(), pe.y(), pe.z());
-        double dt_sample = initTraj.getDuration() / 4.0;
-        for (int si = 1; si <= 3; ++si)
-        {
-          double ts = initTraj.getStartTime() + dt_sample * si;
-          Eigen::Vector3d ps = initTraj.evaluate(ts, SplineTrajectory::Deriv::Pos);
-          ROS_INFO("[DEBUG] initTraj sample t=%.4f pos=(%.3f,%.3f,%.3f)", ts, ps.x(), ps.y(), ps.z());
-        }
-      }
 
       outInnerPts = innerPs;
       outDurations = piece_dur_vec;
@@ -367,23 +602,20 @@ namespace ego_planner
       }
       double t_to_lc_tgt = t_to_lc_end +
                            (traj_.global_traj.glb_t_of_lc_tgt - traj_.global_traj.last_glb_t_of_lc_tgt);
-      int piece_nums = ceil((start_pt - local_target_pt).norm() / pp_.polyTraj_piece_length);
+      double dist = (start_pt - local_target_pt).norm();
+      int piece_nums = ceil(dist / pp_.polyTraj_piece_length);
       if (piece_nums < 2)
         piece_nums = 2;
 
       headState << start_pt, start_vel, start_acc;
       tailState << local_target_pt, local_target_vel, Eigen::Vector3d::Zero();
-
-      // Ensure segment duration is at least ts (= piece_length / max_vel)
-      // to prevent extreme velocities when t_to_lc_tgt is very small
-      double seg_dur_from_time = t_to_lc_tgt / piece_nums;
-      double seg_dur = std::max(seg_dur_from_time, ts);
+      apply_boundary_debug(headState, tailState);
 
       Eigen::MatrixXd innerPs(3, piece_nums - 1);
-      Eigen::VectorXd piece_dur_vec = Eigen::VectorXd::Constant(piece_nums, seg_dur);
+      Eigen::VectorXd piece_dur_vec = Eigen::VectorXd::Constant(piece_nums, t_to_lc_tgt / piece_nums);
+      log_init_summary("prev_opt", headState, tailState, dist, piece_nums, t_to_lc_tgt / piece_nums);
 
-      // Sample inner points using the ORIGINAL timing (from actual trajectories)
-      double t = seg_dur_from_time;
+      double t = piece_dur_vec(0);
       double lc_start = traj_.local_traj.traj.getStartTime();
       double glb_start = traj_.global_traj.traj.getStartTime();
       for (int i = 0; i < piece_nums - 1; ++i)
@@ -402,7 +634,7 @@ namespace ego_planner
           ROS_ERROR("Should not happen! x_x 0x88 t=%.2f, t_to_lc_end=%.2f, t_to_lc_tgt=%.2f", t, t_to_lc_end, t_to_lc_tgt);
         }
 
-        t += seg_dur_from_time;
+        t += piece_dur_vec(i + 1);
       }
 
       initTraj = generateSplineTraj(headState, tailState, innerPs, piece_dur_vec);

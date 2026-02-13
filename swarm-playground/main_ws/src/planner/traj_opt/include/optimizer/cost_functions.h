@@ -59,13 +59,8 @@ namespace ego_planner
     mutable std::vector<double> *min_ellip_dist2_ptr;
     // Accumulated costs for reporting
     mutable Eigen::VectorXd accumulated_costs; // [obs, swarm, feas, sqrvar]
-    // Variance gradient backpropagation:
-    // Stored per-constraint-point gradient from distance variance cost.
-    // Divided by dt and added to gp so that SplineOptimizer's common_weight (omg*dt)
-    // yields the correct effective weight (omg), matching the backup implementation.
-    mutable Eigen::MatrixXd variance_grad_;       // 3 x num_cp, gradient to apply
-    mutable bool has_variance_grad_;              // whether variance gradient is available
-    mutable std::vector<double> segment_dt_;      // dt per segment = T_i / K
+    // dt per segment = T_i / K (used by external variance gradient injection)
+    mutable std::vector<double> segment_dt_;
 
     IntegralCostFunction()
         : grid_map(nullptr), cps(nullptr), swarm_trajs(nullptr),
@@ -74,8 +69,7 @@ namespace ego_planner
           max_vel(0), max_acc(0), max_jer(0),
           drone_id(-1), t_now(0), touch_goal(false), cps_per_piece(5),
           current_seg_(-1), step_in_seg_(0),
-          min_ellip_dist2_ptr(nullptr),
-          has_variance_grad_(false)
+          min_ellip_dist2_ptr(nullptr)
     {
       accumulated_costs.resize(4);
       accumulated_costs.setZero();
@@ -120,16 +114,6 @@ namespace ego_planner
 
       // --- Feasibility costs (vel, acc, jerk) ---
       cost += feasibilityGradCost(v, a, j, gv, ga, gj);
-
-      // --- Distance variance gradient (from previous evaluation) ---
-      // The variance is a discrete cost on constraint points.
-      // Divide by dt so SplineOptimizer's common_weight (omg*dt) gives effective weight omg,
-      // matching the backup's backpropagation pattern.
-      if (has_variance_grad_ && cp_idx < variance_grad_.cols() &&
-          seg_idx < (int)segment_dt_.size() && segment_dt_[seg_idx] > 1e-12)
-      {
-        gp += variance_grad_.col(cp_idx) / segment_dt_[seg_idx];
-      }
 
       ++step_in_seg_;
       return cost;
