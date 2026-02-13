@@ -10,84 +10,7 @@ using namespace std;
 namespace ego_planner
 {
   // =====================================================
-  //  Generate trajectory from states using QuinticSplineND
-  // =====================================================
-  PPoly3D PolyTrajOptimizer::generateTrajectory(
-      const Eigen::MatrixXd &iniState, const Eigen::MatrixXd &finState,
-      const Eigen::MatrixXd &innerPts, const Eigen::VectorXd &durations)
-  {
-    int piece_num = durations.size();
-    // Build waypoints: start + inner + end
-    WaypointsVec waypoints;
-    waypoints.push_back(iniState.col(0)); // start position
-    for (int i = 0; i < innerPts.cols(); ++i)
-      waypoints.push_back(innerPts.col(i));
-    waypoints.push_back(finState.col(0)); // end position
-
-    // Build boundary conditions
-    BCs bc;
-    bc.start_velocity = iniState.col(1);
-    bc.start_acceleration = iniState.col(2);
-    bc.end_velocity = finState.col(1);
-    bc.end_acceleration = finState.col(2);
-
-    // Build time segments
-    std::vector<double> time_segs(piece_num);
-    for (int i = 0; i < piece_num; ++i)
-      time_segs[i] = durations(i);
-
-    // Create and update spline
-    SplineTraj spline;
-    spline.update(time_segs, waypoints, 0.0, bc);
-
-    return spline.getTrajectoryCopy();
-  }
-
-  // =====================================================
-  //  Get initial constraint points from a PPoly3D trajectory
-  // =====================================================
-  Eigen::MatrixXd PolyTrajOptimizer::getInitConstraintPoints(
-      const PPoly3D &traj,
-      const Eigen::VectorXd &durations,
-      int K) const
-  {
-    int N = durations.size();
-    int total_pts = N * K + 1;
-    Eigen::MatrixXd cstr_pts(3, total_pts);
-    int idx = 0;
-    double t_accum = traj.getStartTime();
-
-    ROS_INFO("[DEBUG] getInitConstraintPoints: N=%d, K=%d, total_pts=%d, startTime=%.4f, numSegs=%d",
-             N, K, total_pts, traj.getStartTime(), traj.getNumSegments());
-
-    for (int i = 0; i < N; ++i)
-    {
-      double dur = durations(i);
-      double step = dur / K;
-      for (int j = 0; j <= K; ++j)
-      {
-        double t = t_accum + step * j;
-        cstr_pts.col(idx) = traj.evaluate(t, SplineTrajectory::Deriv::Pos);
-        if (i == 0 && j <= 1) // print first two points
-        {
-          ROS_INFO("[DEBUG] cstr_pts[%d] t=%.4f pos=(%.3f,%.3f,%.3f)",
-                   idx, t, cstr_pts(0,idx), cstr_pts(1,idx), cstr_pts(2,idx));
-        }
-        if (j != K || (j == K && i == N - 1))
-          ++idx;
-      }
-      t_accum += dur;
-    }
-
-    // Print last point
-    ROS_INFO("[DEBUG] cstr_pts[%d] (last) pos=(%.3f,%.3f,%.3f)",
-             total_pts-1, cstr_pts(0,total_pts-1), cstr_pts(1,total_pts-1), cstr_pts(2,total_pts-1));
-
-    return cstr_pts;
-  }
-
-  // =====================================================
-  //  Main optimization API
+  //  Main optimization loop (decision logic)
   // =====================================================
   bool PolyTrajOptimizer::optimizeTrajectory(
       const Eigen::MatrixXd &iniState, const Eigen::MatrixXd &finState,
@@ -137,24 +60,12 @@ namespace ego_planner
     flags.start_a = false;
     flags.end_a = false;
     splineOpt_.setOptimizationFlags(flags);
-    splineOpt_.setEnergyWeights(1.0); // energy (jerk integral) must counterbalance time cost to prevent LBFGS line-search failure
+    splineOpt_.setEnergyWeights(1.0);
     splineOpt_.setIntegralNumSteps(cps_num_prePiece_);
 
     // Generate initial guess
     Eigen::VectorXd x0 = splineOpt_.generateInitialGuess();
     variable_num_ = x0.size();
-
-    ROS_INFO("[DEBUG] optimizeTrajectory: piece_num=%d, variable_num=%d, x0_norm=%.6f",
-             piece_num_, variable_num_, x0.norm());
-    // Print first few x0 values
-    {
-      std::string x0_str = "[";
-      for (int i = 0; i < std::min(variable_num_, 10); ++i)
-        x0_str += std::to_string(x0(i)) + (i < std::min(variable_num_, 10) - 1 ? "," : "");
-      if (variable_num_ > 10) x0_str += ",...";
-      x0_str += "]";
-      ROS_INFO("[DEBUG] x0 (first 10): %s", x0_str.c_str());
-    }
 
     // Copy to raw array for LBFGS
     double x_init[variable_num_];
@@ -203,6 +114,9 @@ namespace ego_planner
       flag_success = false;
       flag_swarm_too_close = false;
 
+      // Reset variance gradient for fresh optimization
+      integral_cost_func_.has_variance_grad_ = false;
+
       // Update swarm weight for retry
       integral_cost_func_.wei_swarm = wei_swarm_mod_;
 
@@ -221,8 +135,8 @@ namespace ego_planner
       double time_ms = (t2 - t1).toSec() * 1000;
       double total_time_ms = (t2 - t0).toSec() * 1000;
 
-      ROS_INFO("[DEBUG] LBFGS result=%d (%s), iter=%d, cost=%.6f, time=%.3fms",
-               result, lbfgs::lbfgs_strerror(result), iter_num_, final_cost, time_ms);
+      PRINTF_COND("LBFGS result=%d (%s), iter=%d, cost=%.6f, time=%.3fms\n",
+                  result, lbfgs::lbfgs_strerror(result), iter_num_, final_cost, time_ms);
 
       if (result == lbfgs::LBFGS_CONVERGENCE ||
           result == lbfgs::LBFGSERR_MAXIMUMITERATION ||
@@ -241,7 +155,6 @@ namespace ego_planner
         {
           // Get optimized trajectory for collision check
           const SplineTraj *opt_spline = splineOpt_.getOptimalSpline();
-          ROS_INFO("[DEBUG] getOptimalSpline() returned %s", opt_spline ? "VALID" : "NULL");
           if (opt_spline)
           {
             PPoly3D traj = opt_spline->getTrajectoryCopy();
@@ -249,29 +162,6 @@ namespace ego_planner
             for (int i = 0; i < piece_num_; ++i)
               durs(i) = (*(opt_spline->getTrajectory().begin() + i)).duration();
 
-            // Debug: print optimized trajectory info
-            {
-              double total_dur = durs.sum();
-              std::string dur_str = "";
-              for (int i = 0; i < piece_num_; ++i)
-                dur_str += std::to_string(durs(i)) + (i < piece_num_ - 1 ? "," : "");
-              ROS_INFO("[DEBUG] opt_traj: pieces=%d, durations=[%s], total_dur=%.3f",
-                       piece_num_, dur_str.c_str(), total_dur);
-              // Sample velocity/acceleration at a few points
-              double dt_sample = total_dur / 4.0;
-              double t0 = traj.getStartTime();
-              for (int si = 0; si <= 4; ++si)
-              {
-                double ts = t0 + dt_sample * si;
-                Eigen::Vector3d ps = traj.evaluate(ts, SplineTrajectory::Deriv::Pos);
-                Eigen::Vector3d vs = traj.evaluate(ts, SplineTrajectory::Deriv::Vel);
-                Eigen::Vector3d as = traj.evaluate(ts, SplineTrajectory::Deriv::Acc);
-                ROS_INFO("[DEBUG] opt_traj t=%.3f pos=(%.3f,%.3f,%.3f) vel=(%.3f,%.3f,%.3f)|%.2f| acc=(%.3f,%.3f,%.3f)|%.2f|",
-                         ts, ps.x(), ps.y(), ps.z(),
-                         vs.x(), vs.y(), vs.z(), vs.norm(),
-                         as.x(), as.y(), as.z(), as.norm());
-              }
-            }
             Eigen::MatrixXd init_points = getInitConstraintPoints(traj, durs, cps_num_prePiece_);
 
             if (finelyCheckAndSetConstraintPoints(segments_nouse, traj, init_points, false) == CHK_RET::OBS_FREE)
@@ -314,160 +204,8 @@ namespace ego_planner
   }
 
   // =====================================================
-  //  LBFGS cost function callback
+  //  Collision detection and constraint point management
   // =====================================================
-  double PolyTrajOptimizer::costFunctionCallback(void *func_data, const double *x, double *grad, const int n)
-  {
-    PolyTrajOptimizer *opt = reinterpret_cast<PolyTrajOptimizer *>(func_data);
-
-    fill(opt->min_ellip_dist2_.begin(), opt->min_ellip_dist2_.end(), std::numeric_limits<double>::max());
-
-    // Copy from raw pointers to Eigen::VectorXd (Map doesn't bind to VectorXd&)
-    Eigen::VectorXd x_vec = Eigen::Map<const Eigen::VectorXd>(x, n);
-    Eigen::VectorXd grad_vec = Eigen::VectorXd::Zero(n);
-
-    // Reset integral cost accumulator
-    opt->integral_cost_func_.resetAccumulation();
-
-    // Use SplineOptimizer::evaluate to compute cost and gradients
-    // Don't pass external workspace — let evaluate use internal_ws_ so getOptimalSpline() works.
-    double total_cost = opt->splineOpt_.evaluate(
-        x_vec, grad_vec,
-        opt->time_cost_func_,
-        opt->integral_cost_func_);
-
-    // Copy gradients back to raw pointer
-    Eigen::Map<Eigen::VectorXd>(grad, n) = grad_vec;
-
-    // Debug: print cost breakdown every iteration
-    {
-      // Compute energy and time costs directly for accurate breakdown.
-      double energy_raw = 0.0, energy_cost = 0.0, time_cost = 0.0;
-      double rho_e = opt->splineOpt_.getEnergyWeight();
-      const SplineTraj *cur_spline = opt->splineOpt_.getOptimalSpline();
-      if (cur_spline)
-      {
-        energy_raw = cur_spline->getEnergy();
-        energy_cost = rho_e * energy_raw; // actual energy contribution to total_cost
-        for (auto &seg_t : cur_spline->getTimeSegments())
-          time_cost += seg_t * opt->time_cost_func_.wei_time;
-      }
-      double weighted_integral = total_cost - energy_cost - time_cost;
-      double obs_raw = opt->integral_cost_func_.accumulated_costs(0);
-      double swarm_raw = opt->integral_cost_func_.accumulated_costs(1);
-      double feas_raw = opt->integral_cost_func_.accumulated_costs(2);
-      ROS_INFO("[DEBUG] iter=%d: total=%.1f, integral=%.1f(obs_r=%.1f,swm_r=%.1f,fea_r=%.1f), energy=%.1f(raw=%.1f,rho=%.2f), time=%.1f, grad=%.1f",
-               opt->iter_num_, total_cost, weighted_integral, obs_raw, swarm_raw, feas_raw, energy_cost, energy_raw, rho_e, time_cost, grad_vec.norm());
-    }
-
-    // Distance variance cost on constraint points (post-processing)
-    if (opt->wei_sqrvar_ > 0 && opt->cps_.cp_size > 1)
-    {
-      Eigen::MatrixXd gdp;
-      double var = 0;
-      opt->distanceSqrVarianceWithGradCost2p(opt->cps_.points, gdp, var);
-      total_cost += var;
-      // Note: The variance gradient on constraint points is not easily backpropagated
-      // through the spline. For now it contributes to the cost but not gradient.
-      // This is acceptable as the variance is a regularization term.
-    }
-
-    // Check for rebound
-    if (opt->allowRebound())
-    {
-      opt->roughlyCheckConstraintPoints();
-    }
-
-    opt->iter_num_ += 1;
-    return total_cost;
-  }
-
-  int PolyTrajOptimizer::earlyExitCallback(void *func_data, const double *x, const double *g, const double fx, const double xnorm, const double gnorm, const double step, int n, int k, int ls)
-  {
-    PolyTrajOptimizer *opt = reinterpret_cast<PolyTrajOptimizer *>(func_data);
-    return (opt->force_stop_type_ == STOP_FOR_ERROR || opt->force_stop_type_ == STOP_FOR_REBOUND);
-  }
-
-  // =====================================================
-  //  Collision checking (adapted for PPoly3D)
-  // =====================================================
-  bool PolyTrajOptimizer::computePointsToCheck(
-      const PPoly3D &traj,
-      int id_cps_end, PtsChk_t &pts_check)
-  {
-    pts_check.clear();
-    pts_check.resize(id_cps_end);
-    const double RES = grid_map_->getResolution(), RES_2 = RES / 2;
-
-    // Build durations vector from PPoly3D segments
-    int num_segs = traj.getNumSegments();
-    Eigen::VectorXd durations(num_segs);
-    double dur_sum = 0;
-    for (int i = 0; i < num_segs; ++i)
-    {
-      durations(i) = (*(traj.begin() + i)).duration();
-      dur_sum += durations(i);
-    }
-
-    Eigen::VectorXd t_seg_start(num_segs + 1);
-    t_seg_start(0) = 0;
-    for (int i = 0; i < num_segs; ++i)
-      t_seg_start(i + 1) = t_seg_start(i) + durations(i);
-
-    const double DURATION = dur_sum;
-    double t_step = min(RES / max_vel_, durations.minCoeff() / max(cps_num_prePiece_, 1) / 1.5);
-    double start_t = traj.getStartTime();
-    Eigen::Vector3d pt_last = traj.evaluate(start_t, SplineTrajectory::Deriv::Pos);
-    int id_cps_curr = 0, id_piece_curr = 0;
-
-    double t = 0.0;
-    while (true)
-    {
-      if (t > DURATION)
-      {
-        if (touch_goal_ && pts_check.size() > 0)
-        {
-          while (pts_check.back().size() == 0)
-            pts_check.pop_back();
-
-          if (pts_check.size() <= 0)
-          {
-            ROS_ERROR("Failed to get points list to check (0x02). pts_check.size()=%d", (int)pts_check.size());
-            return false;
-          }
-          else
-            return true;
-        }
-        else
-        {
-          ROS_ERROR("Failed to get points list to check (0x01). touch_goal_=%d, pts_check.size()=%d", touch_goal_, (int)pts_check.size());
-          pts_check.clear();
-          return false;
-        }
-      }
-
-      const double next_t_stp = t_seg_start(id_piece_curr) + durations(id_piece_curr) / cps_num_prePiece_ * ((id_cps_curr + 1) - cps_num_prePiece_ * id_piece_curr);
-      if (t >= next_t_stp)
-      {
-        if (id_cps_curr + 1 >= cps_num_prePiece_ * (id_piece_curr + 1))
-          ++id_piece_curr;
-        if (++id_cps_curr >= id_cps_end)
-          break;
-      }
-
-      Eigen::Vector3d pt = traj.evaluate(start_t + t, SplineTrajectory::Deriv::Pos);
-      if (t < 1e-5 || pts_check[id_cps_curr].size() == 0 || (pt - pt_last).cwiseAbs().maxCoeff() > RES_2)
-      {
-        pts_check[id_cps_curr].emplace_back(std::pair<double, Eigen::Vector3d>(t, pt));
-        pt_last = pt;
-      }
-
-      t += t_step;
-    }
-
-    return true;
-  }
-
   PolyTrajOptimizer::CHK_RET PolyTrajOptimizer::finelyCheckAndSetConstraintPoints(
       std::vector<std::pair<int, int>> &segments,
       const PPoly3D &traj,
@@ -757,6 +495,9 @@ namespace ego_planner
     return CHK_RET::FINISH;
   }
 
+  // =====================================================
+  //  Rebound detection (during optimization)
+  // =====================================================
   bool PolyTrajOptimizer::roughlyCheckConstraintPoints(void)
   {
     int in_id, out_id;
@@ -942,6 +683,9 @@ namespace ego_planner
     return false;
   }
 
+  // =====================================================
+  //  Rebound gate
+  // =====================================================
   bool PolyTrajOptimizer::allowRebound(void)
   {
     if (iter_num_ < 3)
@@ -982,6 +726,9 @@ namespace ego_planner
     return true;
   }
 
+  // =====================================================
+  //  Multi-topology generation
+  // =====================================================
   std::vector<ConstraintPoints> PolyTrajOptimizer::distinctiveTrajs(vector<std::pair<int, int>> segments)
   {
     if (segments.size() == 0)
@@ -1254,28 +1001,9 @@ namespace ego_planner
     return control_pts_buf;
   }
 
-  void PolyTrajOptimizer::distanceSqrVarianceWithGradCost2p(const Eigen::MatrixXd &ps,
-                                                            Eigen::MatrixXd &gdp,
-                                                            double &var)
-  {
-    int N = ps.cols() - 1;
-    Eigen::MatrixXd dps = ps.rightCols(N) - ps.leftCols(N);
-    Eigen::VectorXd dsqrs = dps.colwise().squaredNorm().transpose();
-    double dquarsum = dsqrs.squaredNorm();
-    double dquarmean = dquarsum / N;
-    var = wei_sqrvar_ * (dquarmean);
-    gdp.resize(3, N + 1);
-    gdp.setZero();
-    for (int i = 0; i <= N; i++)
-    {
-      if (i != 0)
-        gdp.col(i) += wei_sqrvar_ * (4.0 * (dsqrs(i - 1)) / N * dps.col(i - 1));
-      if (i != N)
-        gdp.col(i) += wei_sqrvar_ * (-4.0 * (dsqrs(i)) / N * dps.col(i));
-    }
-  }
-
-  /* helper functions */
+  // =====================================================
+  //  Setters
+  // =====================================================
   void PolyTrajOptimizer::setParam(ros::NodeHandle &nh)
   {
     nh.param("optimization/constraint_points_perPiece", cps_num_prePiece_, -1);
