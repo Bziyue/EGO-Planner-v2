@@ -9,7 +9,6 @@
 #include <traj_utils/plan_container.hpp>
 #include <ros/ros.h>
 #include <traj_utils/planning_visualization.h>
-#include <optimizer/poly_traj_utils.hpp>
 
 namespace ego_planner
 {
@@ -32,7 +31,9 @@ namespace ego_planner
         const Eigen::Vector3d &start_pt, const Eigen::Vector3d &start_vel,
         const Eigen::Vector3d &start_acc, const Eigen::Vector3d &local_target_pt,
         const Eigen::Vector3d &local_target_vel, const bool flag_polyInit,
-        const bool flag_randomPolyTraj, const double &ts, poly_traj::MinJerkOpt &initMJO);
+        const bool flag_randomPolyTraj, const double &ts,
+        PPoly3D &initTraj, Eigen::MatrixXd &innerPts, Eigen::VectorXd &durations,
+        Eigen::Matrix<double, 3, 3> &headState, Eigen::Matrix<double, 3, 3> &tailState);
     bool reboundReplan(
         const Eigen::Vector3d &start_pt, const Eigen::Vector3d &start_vel,
         const Eigen::Vector3d &start_acc, const Eigen::Vector3d &end_pt,
@@ -49,10 +50,9 @@ namespace ego_planner
         bool &touch_goal);
     bool EmergencyStop(Eigen::Vector3d stop_pos);
     bool checkCollision(int drone_id);
-    bool setLocalTrajFromOpt(const poly_traj::MinJerkOpt &opt, const bool touch_goal);
+    bool setLocalTrajFromOpt(const PPoly3D &traj, const Eigen::VectorXd &durations, const bool touch_goal);
     inline double getSwarmClearance(void) { return ploy_traj_opt_->get_swarm_clearance_(); }
     inline int getCpsNumPrePiece(void) { return ploy_traj_opt_->get_cps_num_prePiece_(); }
-    // inline PtsChk_t getPtsCheck(void) { return ploy_traj_opt_->get_pts_check_(); }
 
     PlanParameters pp_;
     GridMap::Ptr grid_map_;
@@ -66,7 +66,7 @@ namespace ego_planner
     int continous_failures_count_{0};
 
   public:
-    typedef unique_ptr<EGOPlannerManager> Ptr;
+    typedef std::unique_ptr<EGOPlannerManager> Ptr;
 
     // !SECTION
   };

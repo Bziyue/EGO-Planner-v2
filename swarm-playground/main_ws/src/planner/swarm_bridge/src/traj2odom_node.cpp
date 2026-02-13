@@ -5,13 +5,17 @@
 #include <iostream>
 #include <nav_msgs/Odometry.h>
 #include <traj_utils/MINCOTraj.h>
-#include <optimizer/poly_traj_utils.hpp>
+#include <SplineTrajectory/SplineTrajectory.hpp>
 
 using namespace std;
 
+using PPoly3D = SplineTrajectory::PPolyND<3>;
+using BCs = SplineTrajectory::BoundaryConditions<3>;
+using WaypointsVec = SplineTrajectory::SplineVector<Eigen::Vector3d>;
+
 struct Traj_t
 {
-  poly_traj::Trajectory traj;
+  PPoly3D traj;
   bool valid;
   ros::Time start_time;
   double duration;
@@ -91,14 +95,31 @@ void one_traj_sub_cb(const traj_utils::MINCOTrajPtr &msg)
     innerPts.col(i) << msg->inner_x[i], msg->inner_y[i], msg->inner_z[i];
   for (int i = 0; i < piece_nums; i++)
     durations(i) = msg->duration[i];
-  poly_traj::MinJerkOpt MJO;
-  MJO.reset(headState, tailState, piece_nums);
-  MJO.generate(innerPts, durations);
 
-  trajs_[recv_id].traj = MJO.getTraj();
+  // Build trajectory using QuinticSplineND
+  WaypointsVec waypoints;
+  waypoints.push_back(headState.col(0));
+  for (int i = 0; i < piece_nums - 1; ++i)
+    waypoints.push_back(innerPts.col(i));
+  waypoints.push_back(tailState.col(0));
+
+  BCs bc;
+  bc.start_velocity = headState.col(1);
+  bc.start_acceleration = headState.col(2);
+  bc.end_velocity = tailState.col(1);
+  bc.end_acceleration = tailState.col(2);
+
+  std::vector<double> time_segs(piece_nums);
+  for (int i = 0; i < piece_nums; ++i)
+    time_segs[i] = durations(i);
+
+  SplineTrajectory::QuinticSplineND<3> spline;
+  spline.update(time_segs, waypoints, 0.0, bc);
+
+  trajs_[recv_id].traj = spline.getTrajectoryCopy();
   trajs_[recv_id].start_time = msg->start_time;
   trajs_[recv_id].valid = true;
-  trajs_[recv_id].duration = trajs_[recv_id].traj.getTotalDuration();
+  trajs_[recv_id].duration = trajs_[recv_id].traj.getDuration();
 }
 
 int main(int argc, char **argv)
@@ -125,8 +146,8 @@ int main(int argc, char **argv)
         if (t_to_start <= trajs_[id].duration)
         {
           double t = t_to_start;
-          Eigen::Vector3d p = trajs_[id].traj.getPos(t);
-          Eigen::Vector3d v = trajs_[id].traj.getVel(t);
+          Eigen::Vector3d p = trajs_[id].traj.evaluate(t, SplineTrajectory::Deriv::Pos);
+          Eigen::Vector3d v = trajs_[id].traj.evaluate(t, SplineTrajectory::Deriv::Vel);
           double yaw = v.head(2).norm() > 0.01 ? atan2(v(1), v(0)) : trajs_[id].last_yaw; //
           trajs_[id].last_yaw = yaw;
           Eigen::AngleAxisd rotation_vector(yaw, Eigen::Vector3d::UnitZ());

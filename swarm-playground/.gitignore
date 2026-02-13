@@ -1,0 +1,68 @@
+# Prerequisites
+*.d
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Linker files
+*.ilk
+
+# Debugger Files
+*.pdb
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# debug information files
+*.dwo
+
+test/
+
+
+# 构建目录
+build/
+devel/
+bin/
+lib/
+out/
+Debug/
+Release/
+x64/
+x86/
+
+# IDE生成的文件
+.vscode/
+.idea/
+.qoder/
+tasks/
+arms_cache/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+.cache/

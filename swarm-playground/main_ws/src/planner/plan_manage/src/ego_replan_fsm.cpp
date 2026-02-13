@@ -3,6 +3,87 @@
 
 namespace ego_planner
 {
+  // Helper: find which segment index a relative time t falls into
+  static int findSegmentIndex(const PPoly3D &traj, double t_rel)
+  {
+    double abs_t = traj.getStartTime() + t_rel;
+    const auto &bp = traj.getBreakpoints();
+    int n = traj.getNumSegments();
+    if (n == 0) return 0;
+    if (abs_t <= bp.front()) return 0;
+    if (abs_t >= bp.back()) return n - 1;
+    for (int i = 0; i < n; ++i)
+    {
+      if (abs_t < bp[i + 1])
+        return i;
+    }
+    return n - 1;
+  }
+
+  // Helper: get durations from PPoly3D
+  static Eigen::VectorXd getDurations(const PPoly3D &traj)
+  {
+    int n = traj.getNumSegments();
+    const auto &bp = traj.getBreakpoints();
+    Eigen::VectorXd durs(n);
+    for (int i = 0; i < n; ++i)
+      durs(i) = bp[i + 1] - bp[i];
+    return durs;
+  }
+
+  // Helper: generate trajectory from head/tail state, inner points, durations
+  static PPoly3D buildSplineTraj(
+      const Eigen::Matrix<double, 3, 3> &headState,
+      const Eigen::Matrix<double, 3, 3> &tailState,
+      const Eigen::MatrixXd &innerPts,
+      const Eigen::VectorXd &durations)
+  {
+    WaypointsVec waypoints;
+    waypoints.push_back(headState.col(0));
+    for (int i = 0; i < innerPts.cols(); ++i)
+      waypoints.push_back(innerPts.col(i));
+    waypoints.push_back(tailState.col(0));
+
+    BCs bc;
+    bc.start_velocity = headState.col(1);
+    bc.start_acceleration = headState.col(2);
+    bc.end_velocity = tailState.col(1);
+    bc.end_acceleration = tailState.col(2);
+
+    std::vector<double> time_segs(durations.size());
+    for (int i = 0; i < durations.size(); ++i)
+      time_segs[i] = durations(i);
+
+    SplineTrajectory::QuinticSplineND<3> spline;
+    spline.update(time_segs, waypoints, 0.0, bc);
+    return spline.getTrajectoryCopy();
+  }
+
+  // Helper: sample K points per piece from trajectory (for proximity check)
+  static Eigen::MatrixXd sampleConstraintPoints(const PPoly3D &traj, int K)
+  {
+    int N = traj.getNumSegments();
+    int total_pts = N * K + 1;
+    Eigen::MatrixXd pts(3, total_pts);
+    int idx = 0;
+    double t_accum = traj.getStartTime();
+    const auto &bp = traj.getBreakpoints();
+
+    for (int i = 0; i < N; ++i)
+    {
+      double dur = bp[i + 1] - bp[i];
+      double step = dur / K;
+      for (int j = 0; j <= K; ++j)
+      {
+        double t = t_accum + step * j;
+        pts.col(idx) = traj.evaluate(t, SplineTrajectory::Deriv::Pos);
+        if (j != K || (j == K && i == N - 1))
+          ++idx;
+      }
+      t_accum += dur;
+    }
+    return pts;
+  }
 
   void EGOReplanFSM::init(ros::NodeHandle &nh)
   {
@@ -173,7 +254,7 @@ namespace ego_planner
       LocalTrajData *info = &planner_manager_->traj_.local_traj;
       double t_cur = ros::Time::now().toSec() - info->start_time;
       t_cur = min(info->duration, t_cur);
-      Eigen::Vector3d pos = info->traj.getPos(t_cur);
+      Eigen::Vector3d pos = info->traj.evaluate(info->traj.getStartTime() + t_cur, SplineTrajectory::Deriv::Pos);
       bool touch_the_goal = ((local_target_pt_ - final_goal_).norm() < 1e-2);
 
       const PtsChk_t* chk_ptr = &planner_manager_->traj_.local_traj.pts_chk;
@@ -317,7 +398,7 @@ namespace ego_planner
 
     /* ---------- check trajectory ---------- */
     double t_temp = t_cur; // t_temp will be changed in the next function!
-    int i_start = info->traj.locatePieceIdx(t_temp);
+    int i_start = findSegmentIndex(info->traj, t_temp);
 
     if (i_start >= (int)pts_chk.size())
     {
@@ -360,7 +441,8 @@ namespace ego_planner
           double t_X = t + (info->start_time - planner_manager_->traj_.swarm_traj.at(id).start_time);
           if (t_X > 0 && t_X < planner_manager_->traj_.swarm_traj.at(id).duration)
           {
-            Eigen::Vector3d swarm_pridicted = planner_manager_->traj_.swarm_traj.at(id).traj.getPos(t_X);
+            Eigen::Vector3d swarm_pridicted = planner_manager_->traj_.swarm_traj.at(id).traj.evaluate(
+                planner_manager_->traj_.swarm_traj.at(id).traj.getStartTime() + t_X, SplineTrajectory::Deriv::Pos);
             double dist = (p - swarm_pridicted).norm();
             double allowed_dist = planner_manager_->getSwarmClearance() + planner_manager_->traj_.swarm_traj.at(id).des_clearance;
             if (dist < allowed_dist)
@@ -475,9 +557,10 @@ namespace ego_planner
     LocalTrajData *info = &planner_manager_->traj_.local_traj;
     double t_cur = ros::Time::now().toSec() - info->start_time;
 
-    start_pt_ = info->traj.getPos(t_cur);
-    start_vel_ = info->traj.getVel(t_cur);
-    start_acc_ = info->traj.getAcc(t_cur);
+    double t_abs = info->traj.getStartTime() + t_cur;
+    start_pt_ = info->traj.evaluate(t_abs, SplineTrajectory::Deriv::Pos);
+    start_vel_ = info->traj.evaluate(t_abs, SplineTrajectory::Deriv::Vel);
+    start_acc_ = info->traj.evaluate(t_abs, SplineTrajectory::Deriv::Acc);
 
     bool success = callReboundReplan(false, false);
 
@@ -521,9 +604,11 @@ namespace ego_planner
       constexpr double step_size_t = 0.1;
       int i_end = floor(planner_manager_->traj_.global_traj.duration / step_size_t);
       vector<Eigen::Vector3d> gloabl_traj(i_end);
+      double glb_start = planner_manager_->traj_.global_traj.traj.getStartTime();
       for (int i = 0; i < i_end; i++)
       {
-        gloabl_traj[i] = planner_manager_->traj_.global_traj.traj.getPos(i * step_size_t);
+        gloabl_traj[i] = planner_manager_->traj_.global_traj.traj.evaluate(
+            glb_start + i * step_size_t, SplineTrajectory::Deriv::Pos);
       }
 
       have_target_ = true;
@@ -557,9 +642,11 @@ namespace ego_planner
     {
       Eigen::Vector3d orig_goal = final_goal_;
       double t_step = planner_manager_->grid_map_->getResolution() / planner_manager_->pp_.max_vel_;
+      double glb_start = planner_manager_->traj_.global_traj.traj.getStartTime();
       for (double t = planner_manager_->traj_.global_traj.duration; t > 0; t -= t_step)
       {
-        Eigen::Vector3d pt = planner_manager_->traj_.global_traj.traj.getPos(t);
+        Eigen::Vector3d pt = planner_manager_->traj_.global_traj.traj.evaluate(
+            glb_start + t, SplineTrajectory::Deriv::Pos);
         if (!planner_manager_->grid_map_->getInflateOccupancy(pt))
         {
           if (planNextWaypoint(pt)) // final_goal_=pt inside if success
@@ -728,12 +815,11 @@ namespace ego_planner
       innerPts.col(i) << msg->inner_x[i], msg->inner_y[i], msg->inner_z[i];
     for (int i = 0; i < piece_nums; i++)
       durations(i) = msg->duration[i];
-    poly_traj::MinJerkOpt MJO;
-    MJO.reset(headState, tailState, piece_nums);
-    MJO.generate(innerPts, durations);
+
+    PPoly3D trajectory = buildSplineTraj(headState, tailState, innerPts, durations);
 
     /* Ignore the trajectories that are far away */
-    Eigen::MatrixXd cps_chk = MJO.getInitConstraintPoints(5); // K = 5, such accuracy is sufficient
+    Eigen::MatrixXd cps_chk = sampleConstraintPoints(trajectory, 5); // K = 5, such accuracy is sufficient
     bool far_away = true;
     for (int i = 0; i < cps_chk.cols(); ++i)
     {
@@ -745,13 +831,12 @@ namespace ego_planner
     }
     if (!far_away || !have_recv_pre_agent_) // Accept a far traj if no previous agent received
     {
-      poly_traj::Trajectory trajectory = MJO.getTraj();
       planner_manager_->traj_.swarm_traj[recv_id].traj = trajectory;
       planner_manager_->traj_.swarm_traj[recv_id].drone_id = recv_id;
       planner_manager_->traj_.swarm_traj[recv_id].traj_id = msg->traj_id;
       planner_manager_->traj_.swarm_traj[recv_id].start_time = msg->start_time.toSec();
-      planner_manager_->traj_.swarm_traj[recv_id].duration = trajectory.getTotalDuration();
-      planner_manager_->traj_.swarm_traj[recv_id].start_pos = trajectory.getPos(0.0);
+      planner_manager_->traj_.swarm_traj[recv_id].duration = trajectory.getDuration();
+      planner_manager_->traj_.swarm_traj[recv_id].start_pos = trajectory.evaluate(trajectory.getStartTime(), SplineTrajectory::Deriv::Pos);
       planner_manager_->traj_.swarm_traj[recv_id].des_clearance = msg->des_clearance;
 
       /* Check Collision */
@@ -787,8 +872,8 @@ namespace ego_planner
   {
 
     auto data = &planner_manager_->traj_.local_traj;
-    Eigen::VectorXd durs = data->traj.getDurations();
-    int piece_num = data->traj.getPieceNum();
+    Eigen::VectorXd durs = getDurations(data->traj);
+    int piece_num = data->traj.getNumSegments();
 
     poly_msg.drone_id = planner_manager_->pp_.drone_id;
     poly_msg.traj_id = data->traj_id;
@@ -802,13 +887,15 @@ namespace ego_planner
     {
       poly_msg.duration[i] = durs(i);
 
-      poly_traj::CoefficientMat cMat = data->traj.getPiece(i).getCoeffMat();
+      // Access segment coefficients: getCoeffs() returns (num_coeffs x DIM) block
+      // Row k = coefficient for t^k, columns = [x, y, z]
+      auto seg_coeffs = data->traj[i].getCoeffs();
       int i6 = i * 6;
       for (int j = 0; j < 6; j++)
       {
-        poly_msg.coef_x[i6 + j] = cMat(0, j);
-        poly_msg.coef_y[i6 + j] = cMat(1, j);
-        poly_msg.coef_z[i6 + j] = cMat(2, j);
+        poly_msg.coef_x[i6 + j] = seg_coeffs(j, 0);
+        poly_msg.coef_y[i6 + j] = seg_coeffs(j, 1);
+        poly_msg.coef_z[i6 + j] = seg_coeffs(j, 2);
       }
     }
 
@@ -818,28 +905,33 @@ namespace ego_planner
     MINCO_msg.order = 5; // todo, only support order = 5 now.
     MINCO_msg.duration.resize(piece_num);
     MINCO_msg.des_clearance = planner_manager_->getSwarmClearance();
+
+    double t_start = data->traj.getStartTime();
+    double t_end = data->traj.getEndTime();
     Eigen::Vector3d vec;
-    vec = data->traj.getPos(0);
+    vec = data->traj.evaluate(t_start, SplineTrajectory::Deriv::Pos);
     MINCO_msg.start_p[0] = vec(0), MINCO_msg.start_p[1] = vec(1), MINCO_msg.start_p[2] = vec(2);
-    vec = data->traj.getVel(0);
+    vec = data->traj.evaluate(t_start, SplineTrajectory::Deriv::Vel);
     MINCO_msg.start_v[0] = vec(0), MINCO_msg.start_v[1] = vec(1), MINCO_msg.start_v[2] = vec(2);
-    vec = data->traj.getAcc(0);
+    vec = data->traj.evaluate(t_start, SplineTrajectory::Deriv::Acc);
     MINCO_msg.start_a[0] = vec(0), MINCO_msg.start_a[1] = vec(1), MINCO_msg.start_a[2] = vec(2);
-    vec = data->traj.getPos(data->duration);
+    vec = data->traj.evaluate(t_end, SplineTrajectory::Deriv::Pos);
     MINCO_msg.end_p[0] = vec(0), MINCO_msg.end_p[1] = vec(1), MINCO_msg.end_p[2] = vec(2);
-    vec = data->traj.getVel(data->duration);
+    vec = data->traj.evaluate(t_end, SplineTrajectory::Deriv::Vel);
     MINCO_msg.end_v[0] = vec(0), MINCO_msg.end_v[1] = vec(1), MINCO_msg.end_v[2] = vec(2);
-    vec = data->traj.getAcc(data->duration);
+    vec = data->traj.evaluate(t_end, SplineTrajectory::Deriv::Acc);
     MINCO_msg.end_a[0] = vec(0), MINCO_msg.end_a[1] = vec(1), MINCO_msg.end_a[2] = vec(2);
     MINCO_msg.inner_x.resize(piece_num - 1);
     MINCO_msg.inner_y.resize(piece_num - 1);
     MINCO_msg.inner_z.resize(piece_num - 1);
-    Eigen::MatrixXd pos = data->traj.getPositions();
+    // Get inner waypoints from breakpoints
+    const auto &bp = data->traj.getBreakpoints();
     for (int i = 0; i < piece_num - 1; i++)
     {
-      MINCO_msg.inner_x[i] = pos(0, i + 1);
-      MINCO_msg.inner_y[i] = pos(1, i + 1);
-      MINCO_msg.inner_z[i] = pos(2, i + 1);
+      Eigen::Vector3d pt = data->traj.evaluate(bp[i + 1], SplineTrajectory::Deriv::Pos);
+      MINCO_msg.inner_x[i] = pt(0);
+      MINCO_msg.inner_y[i] = pt(1);
+      MINCO_msg.inner_z[i] = pt(2);
     }
     for (int i = 0; i < piece_num; i++)
       MINCO_msg.duration[i] = durs[i];
@@ -860,7 +952,7 @@ namespace ego_planner
     double traj_t = (t_now.toSec() - traj->start_time) + forward_t;
     if (traj_t <= traj->duration)
     {
-      Eigen::Vector3d forward_p = traj->traj.getPos(traj_t);
+      Eigen::Vector3d forward_p = traj->traj.evaluate(traj->traj.getStartTime() + traj_t, SplineTrajectory::Deriv::Pos);
 
       double reso = map->getResolution();
       for (;; forward_p(2) -= reso)

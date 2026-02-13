@@ -581,6 +581,7 @@ namespace SplineTrajectory
 
         void setOptimizationFlags(const OptimizationFlags &flags) { flags_ = flags; }
         void setEnergyWeights(double rho_energy) { rho_energy_ = rho_energy; }
+        double getEnergyWeight() const { return rho_energy_; }
         void setIntegralNumSteps(int steps) { integral_num_steps_ = steps; }
 
         /**

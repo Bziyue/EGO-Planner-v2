@@ -1,12 +1,13 @@
 #include <nav_msgs/Odometry.h>
 #include <traj_utils/PolyTraj.h>
-#include <optimizer/poly_traj_utils.hpp>
+#include <SplineTrajectory/SplineTrajectory.hpp>
 #include <quadrotor_msgs/PositionCommand.h>
 #include <std_msgs/Empty.h>
 #include <visualization_msgs/Marker.h>
 #include <ros/ros.h>
 
 using namespace Eigen;
+using PPoly3D = SplineTrajectory::PPolyND<3>;
 
 ros::Publisher pos_cmd_pub;
 
@@ -18,7 +19,7 @@ quadrotor_msgs::PositionCommand cmd;
 #define TURN_YAW_TO_CENTER_AT_END 0
 
 bool receive_traj_ = false;
-boost::shared_ptr<poly_traj::Trajectory> traj_;
+boost::shared_ptr<PPoly3D> traj_;
 double traj_duration_;
 ros::Time start_time_;
 int traj_id_;
@@ -48,25 +49,33 @@ void polyTrajCallback(traj_utils::PolyTrajPtr msg)
   }
 
   int piece_nums = msg->duration.size();
-  std::vector<double> dura(piece_nums);
-  std::vector<poly_traj::CoefficientMat> cMats(piece_nums);
+  const int num_coeffs = 6; // order + 1
+
+  // Build breakpoints: [0, dur0, dur0+dur1, ...]
+  std::vector<double> breakpoints(piece_nums + 1);
+  breakpoints[0] = 0.0;
+  for (int i = 0; i < piece_nums; ++i)
+    breakpoints[i + 1] = breakpoints[i] + msg->duration[i];
+
+  // Build coefficient matrix: (piece_nums * num_coeffs) x 3, RowMajor
+  // Row (i * num_coeffs + k) = coefficient for segment i, power k
+  using MatrixType = Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor>;
+  MatrixType coefficients(piece_nums * num_coeffs, 3);
   for (int i = 0; i < piece_nums; ++i)
   {
     int i6 = i * 6;
-    cMats[i].row(0) << msg->coef_x[i6 + 0], msg->coef_x[i6 + 1], msg->coef_x[i6 + 2],
-        msg->coef_x[i6 + 3], msg->coef_x[i6 + 4], msg->coef_x[i6 + 5];
-    cMats[i].row(1) << msg->coef_y[i6 + 0], msg->coef_y[i6 + 1], msg->coef_y[i6 + 2],
-        msg->coef_y[i6 + 3], msg->coef_y[i6 + 4], msg->coef_y[i6 + 5];
-    cMats[i].row(2) << msg->coef_z[i6 + 0], msg->coef_z[i6 + 1], msg->coef_z[i6 + 2],
-        msg->coef_z[i6 + 3], msg->coef_z[i6 + 4], msg->coef_z[i6 + 5];
-
-    dura[i] = msg->duration[i];
+    for (int j = 0; j < 6; j++)
+    {
+      coefficients(i * num_coeffs + j, 0) = msg->coef_x[i6 + j];
+      coefficients(i * num_coeffs + j, 1) = msg->coef_y[i6 + j];
+      coefficients(i * num_coeffs + j, 2) = msg->coef_z[i6 + j];
+    }
   }
 
-  traj_.reset(new poly_traj::Trajectory(dura, cMats));
+  traj_.reset(new PPoly3D(breakpoints, coefficients, num_coeffs));
 
   start_time_ = msg->start_time;
-  traj_duration_ = traj_->getTotalDuration();
+  traj_duration_ = traj_->getDuration();
   traj_id_ = msg->traj_id;
 
   receive_traj_ = true;
@@ -79,8 +88,8 @@ std::pair<double, double> calculate_yaw(double t_cur, Eigen::Vector3d &pos, doub
   std::pair<double, double> yaw_yawdot(0, 0);
 
   Eigen::Vector3d dir = t_cur + time_forward_ <= traj_duration_
-                            ? traj_->getPos(t_cur + time_forward_) - pos
-                            : traj_->getPos(traj_duration_) - pos;
+                            ? traj_->evaluate(t_cur + time_forward_, SplineTrajectory::Deriv::Pos) - pos
+                            : traj_->evaluate(traj_duration_, SplineTrajectory::Deriv::Pos) - pos;
   double yaw_temp = dir.norm() > 0.1
                         ? atan2(dir(1), dir(0))
                         : last_yaw_;
@@ -192,10 +201,10 @@ void cmdCallback(const ros::TimerEvent &e)
 #endif
   if (t_cur < traj_duration_ && t_cur >= 0.0)
   {
-    pos = traj_->getPos(t_cur);
-    vel = traj_->getVel(t_cur);
-    acc = traj_->getAcc(t_cur);
-    jer = traj_->getJer(t_cur);
+    pos = traj_->evaluate(t_cur, SplineTrajectory::Deriv::Pos);
+    vel = traj_->evaluate(t_cur, SplineTrajectory::Deriv::Vel);
+    acc = traj_->evaluate(t_cur, SplineTrajectory::Deriv::Acc);
+    jer = traj_->evaluate(t_cur, SplineTrajectory::Deriv::Jerk);
 
     /*** calculate yaw ***/
     yaw_yawdot = calculate_yaw(t_cur, pos, (time_now - time_last).toSec());
@@ -227,7 +236,7 @@ void cmdCallback(const ros::TimerEvent &e)
       return;
 
     /* hover when finished traj_ */
-    pos = traj_->getPos(traj_duration_);
+    pos = traj_->evaluate(traj_duration_, SplineTrajectory::Deriv::Pos);
     vel.setZero();
     acc.setZero();
     jer.setZero();
@@ -265,7 +274,7 @@ void cmdCallback(const ros::TimerEvent &e)
       return;
 
     /* hover when finished traj_ */
-    pos = traj_->getPos(traj_duration_);
+    pos = traj_->evaluate(traj_duration_, SplineTrajectory::Deriv::Pos);
     vel.setZero();
     acc.setZero();
     jer.setZero();
