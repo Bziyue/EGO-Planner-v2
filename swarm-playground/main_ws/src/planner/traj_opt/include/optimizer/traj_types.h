@@ -20,7 +20,7 @@ namespace ego_planner
   // PPoly3D is already defined in plan_container.hpp
   using Vec3 = Eigen::Vector3d;
   using BCs = SplineTrajectory::BoundaryConditions<TRAJ_DIM>;
-  using WaypointsVec = SplineTrajectory::SplineVector<Eigen::Vector3d>;
+  using WaypointsMat = typename SplineTraj::MatrixType;
 
   // =====================================================
   //  ConstraintPoints: deformation points for obstacle avoidance

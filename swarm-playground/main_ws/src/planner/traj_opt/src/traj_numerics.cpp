@@ -75,11 +75,11 @@ namespace ego_planner
   {
     int piece_num = durations.size();
     // Build waypoints: start + inner + end
-    WaypointsVec waypoints;
-    waypoints.push_back(iniState.col(0)); // start position
+    WaypointsMat waypoints(innerPts.cols() + 2, 3);
+    waypoints.row(0) = iniState.col(0).transpose();
     for (int i = 0; i < innerPts.cols(); ++i)
-      waypoints.push_back(innerPts.col(i));
-    waypoints.push_back(finState.col(0)); // end position
+      waypoints.row(i + 1) = innerPts.col(i).transpose();
+    waypoints.row(innerPts.cols() + 1) = finState.col(0).transpose();
 
     // Build boundary conditions
     BCs bc;
@@ -182,7 +182,7 @@ namespace ego_planner
 
       Eigen::VectorXd grad_var = Eigen::VectorXd::Zero(n);
       ZeroTimeCostFunction zero_time;
-      double rho_backup = opt->splineOpt_.getEnergyWeight();
+      double rho_backup = opt->rho_energy_;
       opt->splineOpt_.setEnergyWeights(0.0);
       opt->splineOpt_.evaluate(x_vec, grad_var, zero_time, var_cost);
       opt->splineOpt_.setEnergyWeights(rho_backup);
@@ -206,7 +206,7 @@ namespace ego_planner
       double energy_cost = 0.0;
       const SplineTraj *opt_spline = opt->splineOpt_.getOptimalSpline();
       if (opt_spline)
-        energy_cost = opt->splineOpt_.getEnergyWeight() * opt_spline->getEnergy();
+        energy_cost = opt->rho_energy_ * opt_spline->getEnergy();
 
       // Backup weights
       double wei_obs = opt->integral_cost_func_.wei_obs;
@@ -218,7 +218,7 @@ namespace ego_planner
         Eigen::VectorXd dummy_grad = Eigen::VectorXd::Zero(n);
         ZeroTimeCostFunction zero_time;
         opt->integral_cost_func_.resetAccumulation();
-        double rho_backup = opt->splineOpt_.getEnergyWeight();
+        double rho_backup = opt->rho_energy_;
         opt->splineOpt_.setEnergyWeights(0.0);
         double cost = opt->splineOpt_.evaluate(x_vec, dummy_grad, zero_time, opt->integral_cost_func_);
         opt->splineOpt_.setEnergyWeights(rho_backup);

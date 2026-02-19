@@ -53,6 +53,7 @@ namespace ego_planner
     double wei_time_;
     double obs_clearance_, obs_clearance_soft_, swarm_clearance_;
     double max_vel_, max_acc_, max_jer_;
+    double rho_energy_{1.0};
 
     double t_now_;
 

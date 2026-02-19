@@ -9,9 +9,9 @@
 
 using namespace std;
 
-using PPoly3D = SplineTrajectory::PPolyND<3>;
+using PPoly3D = SplineTrajectory::PPolyND<3, 6>;
 using BCs = SplineTrajectory::BoundaryConditions<3>;
-using WaypointsVec = SplineTrajectory::SplineVector<Eigen::Vector3d>;
+using WaypointsMat = typename SplineTrajectory::QuinticSplineND<3>::MatrixType;
 
 struct Traj_t
 {
@@ -97,11 +97,11 @@ void one_traj_sub_cb(const traj_utils::MINCOTrajPtr &msg)
     durations(i) = msg->duration[i];
 
   // Build trajectory using QuinticSplineND
-  WaypointsVec waypoints;
-  waypoints.push_back(headState.col(0));
+  WaypointsMat waypoints(piece_nums + 1, 3);
+  waypoints.row(0) = headState.col(0).transpose();
   for (int i = 0; i < piece_nums - 1; ++i)
-    waypoints.push_back(innerPts.col(i));
-  waypoints.push_back(tailState.col(0));
+    waypoints.row(i + 1) = innerPts.col(i).transpose();
+  waypoints.row(piece_nums) = tailState.col(0).transpose();
 
   BCs bc;
   bc.start_velocity = headState.col(1);

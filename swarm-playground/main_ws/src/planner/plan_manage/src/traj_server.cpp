@@ -7,7 +7,7 @@
 #include <ros/ros.h>
 
 using namespace Eigen;
-using PPoly3D = SplineTrajectory::PPolyND<3>;
+using PPoly3D = SplineTrajectory::PPolyND<3, 6>;
 
 ros::Publisher pos_cmd_pub;
 

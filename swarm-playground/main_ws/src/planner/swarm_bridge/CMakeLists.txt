@@ -35,6 +35,7 @@ add_executable(bridge_node_udp
 target_link_libraries(bridge_node_udp 
   ${catkin_LIBRARIES}
   )
+add_dependencies(bridge_node_udp ${catkin_EXPORTED_TARGETS})
 
 if(ENABLE_TCP)
 
@@ -46,6 +47,7 @@ if(ENABLE_TCP)
     zmq
     zmqpp
     )
+  add_dependencies(bridge_node_tcp ${catkin_EXPORTED_TARGETS})
 
 endif(ENABLE_TCP)
 
@@ -55,5 +57,5 @@ add_executable(traj2odom_node
 target_link_libraries(traj2odom_node 
   ${catkin_LIBRARIES}
   )
-
+add_dependencies(traj2odom_node ${catkin_EXPORTED_TARGETS})
 

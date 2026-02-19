@@ -43,11 +43,11 @@ namespace ego_planner
       const Eigen::VectorXd &durations)
   {
     int piece_num = durations.size();
-    WaypointsVec waypoints;
-    waypoints.push_back(headState.col(0));
+    WaypointsMat waypoints(innerPts.cols() + 2, 3);
+    waypoints.row(0) = headState.col(0).transpose();
     for (int i = 0; i < innerPts.cols(); ++i)
-      waypoints.push_back(innerPts.col(i));
-    waypoints.push_back(tailState.col(0));
+      waypoints.row(i + 1) = innerPts.col(i).transpose();
+    waypoints.row(innerPts.cols() + 1) = tailState.col(0).transpose();
 
     BCs bc;
     bc.start_velocity = headState.col(1);

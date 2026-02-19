@@ -121,7 +121,7 @@ namespace SplineTrajectory
          * Rows correspond to q0, q1, ... qN
          * @return           Cost value
          */
-        double operator()(const SplineVector<Eigen::Matrix<double, Eigen::Dynamic, 1>> &waypoints, 
+        double operator()(const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> &waypoints,
                           Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> &grad_q) const;
     };
 #endif
@@ -365,7 +365,7 @@ namespace SplineTrajectory
     public:
         using VectorType = typename SplineType::VectorType;
         using MatrixType = typename SplineType::MatrixType;
-        using WaypointsType = SplineVector<VectorType>;
+        using WaypointsType = MatrixType;
 
         /**
          * @brief Workspace holds all mutable state required during optimization.
@@ -388,23 +388,34 @@ namespace SplineTrajectory
 
             Eigen::VectorXd explicit_time_grad_buffer;
             MatrixType discrete_grad_q_buffer;
+            std::vector<double> segment_start_times;
+            std::vector<double> segment_costs;
 
             void resize(int num_segments)
             {
                 if (static_cast<int>(cache_times.size()) != num_segments)
                 {
                     cache_times.resize(num_segments);
-                    cache_waypoints.resize(num_segments + 1);
+                    cache_waypoints.resize(num_segments + 1, DIM);
                     cache_gdT.resize(num_segments);
                     user_gdT_buffer.resize(num_segments);
                     cache_gdC.resize(num_segments * SplineType::COEFF_NUM, DIM);
                     explicit_time_grad_buffer.resize(num_segments);
                     discrete_grad_q_buffer.resize(num_segments + 1, DIM);
+                    segment_start_times.resize(num_segments);
+                    segment_costs.resize(num_segments);
                 }
             }
         };
 
     private:
+        struct SpatialVariableLayout
+        {
+            int point_index = 0;
+            int offset = 0;
+            int dof = 0;
+        };
+
         std::vector<double> ref_times_;
         WaypointsType ref_waypoints_;
         BoundaryConditions<DIM> ref_bc_;
@@ -426,6 +437,10 @@ namespace SplineTrajectory
         mutable std::unique_ptr<Workspace> internal_ws_;
         
         mutable std::string last_error_message_;
+        mutable std::vector<SpatialVariableLayout> spatial_layout_;
+        mutable int derivatives_offset_ = 0;
+        mutable int total_dimension_ = 0;
+        mutable bool layout_dirty_ = true;
         
         /**
          * @brief Helper method to retrieve or create the internal workspace.
@@ -438,6 +453,88 @@ namespace SplineTrajectory
                 internal_ws_ = std::make_unique<Workspace>();
             }
             return internal_ws_.get();
+        }
+
+        void markLayoutDirty()
+        {
+            layout_dirty_ = true;
+        }
+
+        bool isSpatialOptimized(int idx) const
+        {
+            if (idx == 0)
+            {
+                return flags_.start_p;
+            }
+            if (idx == num_segments_)
+            {
+                return flags_.end_p;
+            }
+            return true;
+        }
+
+        int countOptimizedDerivativeBlocks() const
+        {
+            int blocks = 0;
+            if (flags_.start_v) ++blocks;
+            if constexpr (SplineType::ORDER >= 5)
+            {
+                if (flags_.start_a) ++blocks;
+            }
+            if constexpr (SplineType::ORDER >= 7)
+            {
+                if (flags_.start_j) ++blocks;
+            }
+
+            if (flags_.end_v) ++blocks;
+            if constexpr (SplineType::ORDER >= 5)
+            {
+                if (flags_.end_a) ++blocks;
+            }
+            if constexpr (SplineType::ORDER >= 7)
+            {
+                if (flags_.end_j) ++blocks;
+            }
+            return blocks;
+        }
+
+        void rebuildLayoutCache() const
+        {
+            spatial_layout_.clear();
+
+            if (num_segments_ <= 0)
+            {
+                derivatives_offset_ = 0;
+                total_dimension_ = 0;
+                layout_dirty_ = false;
+                return;
+            }
+
+            int offset = num_segments_;
+            for (int i = 0; i <= num_segments_; ++i)
+            {
+                if (!isSpatialOptimized(i))
+                {
+                    continue;
+                }
+
+                const int dof = active_spatial_map_->getUnconstrainedDim(i);
+                spatial_layout_.push_back(SpatialVariableLayout{i, offset, dof});
+                offset += dof;
+            }
+
+            derivatives_offset_ = offset;
+            total_dimension_ = derivatives_offset_ + countOptimizedDerivativeBlocks() * DIM;
+            layout_dirty_ = false;
+        }
+
+        void ensureLayoutCache() const
+        {
+            if (!layout_dirty_)
+            {
+                return;
+            }
+            rebuildLayoutCache();
         }
         
         static constexpr double MIN_VALID_DURATION = 1e-3; // 1 ms
@@ -460,7 +557,11 @@ namespace SplineTrajectory
               rho_energy_(other.rho_energy_),
               integral_num_steps_(other.integral_num_steps_),
               default_time_map_(other.default_time_map_),
-              default_spatial_map_(other.default_spatial_map_)
+              default_spatial_map_(other.default_spatial_map_),
+              spatial_layout_(other.spatial_layout_),
+              derivatives_offset_(other.derivatives_offset_),
+              total_dimension_(other.total_dimension_),
+              layout_dirty_(other.layout_dirty_)
         {
             active_time_map_ = (other.active_time_map_ == &other.default_time_map_)
                               ? &default_time_map_
@@ -488,6 +589,10 @@ namespace SplineTrajectory
                 integral_num_steps_ = other.integral_num_steps_;
                 default_time_map_ = other.default_time_map_;
                 default_spatial_map_ = other.default_spatial_map_;
+                spatial_layout_ = other.spatial_layout_;
+                derivatives_offset_ = other.derivatives_offset_;
+                total_dimension_ = other.total_dimension_;
+                layout_dirty_ = other.layout_dirty_;
 
                 active_time_map_ = (other.active_time_map_ == &other.default_time_map_)
                                   ? &default_time_map_
@@ -522,6 +627,7 @@ namespace SplineTrajectory
         void setSpatialMap(const SpatialMap* map)
         {
             active_spatial_map_ = (map != nullptr) ? map : &default_spatial_map_;
+            markLayoutDirty();
         }
 
         /**
@@ -568,6 +674,7 @@ namespace SplineTrajectory
             ref_waypoints_ = waypoints;
             ref_bc_ = bc;
             num_segments_ = static_cast<int>(ref_times_.size());
+            markLayoutDirty();
 
             is_valid_ = checkValidity();
             
@@ -579,9 +686,12 @@ namespace SplineTrajectory
             return is_valid_;
         }
 
-        void setOptimizationFlags(const OptimizationFlags &flags) { flags_ = flags; }
+        void setOptimizationFlags(const OptimizationFlags &flags)
+        {
+            flags_ = flags;
+            markLayoutDirty();
+        }
         void setEnergyWeights(double rho_energy) { rho_energy_ = rho_energy; }
-        double getEnergyWeight() const { return rho_energy_; }
         void setIntegralNumSteps(int steps) { integral_num_steps_ = steps; }
 
         /**
@@ -620,8 +730,8 @@ namespace SplineTrajectory
                                  " != num_segments_ = " + std::to_string(num_segments_));
             }
             
-            if (ref_waypoints_.size() != static_cast<size_t>(num_segments_ + 1)) {
-                errors.push_back("Size mismatch: ref_waypoints_.size() = " + std::to_string(ref_waypoints_.size()) + 
+            if (ref_waypoints_.rows() != num_segments_ + 1) {
+                errors.push_back("Size mismatch: ref_waypoints_.rows() = " + std::to_string(ref_waypoints_.rows()) + 
                                  " != num_segments_ + 1 = " + std::to_string(num_segments_ + 1));
             }
             
@@ -639,9 +749,9 @@ namespace SplineTrajectory
                 }
             }
             
-            for (size_t i = 0; i < ref_waypoints_.size(); ++i) {
-                if (!ref_waypoints_[i].array().isFinite().all()) {
-                    errors.push_back("Waypoint [" + std::to_string(i) + "] contains NaN or Inf");
+            for (int i = 0; i < ref_waypoints_.rows(); ++i) {
+                if (!ref_waypoints_.row(i).array().isFinite().all()) {
+                    errors.push_back("Waypoint row [" + std::to_string(i) + "] contains NaN or Inf");
                 }
             }
             
@@ -690,29 +800,22 @@ namespace SplineTrajectory
          */
         Eigen::VectorXd generateInitialGuess() const
         {
-            int dim = calculateDimension();
+            ensureLayoutCache();
+            int dim = total_dimension_;
             Eigen::VectorXd x(dim);
-            int offset = 0;
-
-            for (double t : ref_times_)
-                x(offset++) = active_time_map_->toTau(t);
-
-            auto is_spatial_optimized = [&](int idx) {
-                if (idx == 0) return flags_.start_p;
-                if (idx == num_segments_) return flags_.end_p;
-                return true; 
-            };
-
-            for (int i = 0; i <= num_segments_; ++i)
+            for (int i = 0; i < num_segments_; ++i)
             {
-                if (is_spatial_optimized(i)) {
-                    int dof = active_spatial_map_->getUnconstrainedDim(i);
-                    x.segment(offset, dof) = active_spatial_map_->toUnconstrained(ref_waypoints_[i], i);
-                    offset += dof;
-                }
+                x(i) = active_time_map_->toTau(ref_times_[i]);
+            }
+
+            for (const auto &var : spatial_layout_)
+            {
+                x.segment(var.offset, var.dof) =
+                    active_spatial_map_->toUnconstrained(ref_waypoints_.row(var.point_index).transpose(), var.point_index);
             }
 
             BoundaryConditions<DIM> bc = ref_bc_;
+            int offset = derivatives_offset_;
             auto apply_derivatives = [&](auto&& op) {
                 if (flags_.start_v) op(bc.start_velocity);
                 if constexpr (SplineType::ORDER >= 5) if (flags_.start_a) op(bc.start_acceleration);
@@ -748,14 +851,16 @@ namespace SplineTrajectory
             using TCF = typename std::decay<TimeCostFunc>::type;
             using WCF = typename std::decay<WaypointsCostFunc>::type;
             using SCF = typename std::decay<IntegralCostFunc>::type;
+            constexpr bool kSupportsMatrixWaypointsCost =
+                TypeTraits::HasWaypointsCostInterface<WCF, WaypointsType>::value;
 
             static_assert(TypeTraits::HasTimeCostInterface<TCF>::value,
                           "\n[SplineOptimizer Error] 'TimeCostFunc' signature mismatch.\n"
                           "Required: double operator()(const vector<double>& Ts, VectorXd &grad)\n");
 
-            static_assert(TypeTraits::HasWaypointsCostInterface<WCF, WaypointsType>::value,
+            static_assert(kSupportsMatrixWaypointsCost,
                           "\n[SplineOptimizer Error] 'WaypointsCostFunc' signature mismatch.\n"
-                          "Required: double operator()(const WaypointsType& qs, MatrixXd &grad_q)\n");
+                          "Required: double operator()(const MatrixType& qs, MatrixXd &grad_q)\n");
 
             static_assert(TypeTraits::HasIntegralCostInterface<SCF, VectorType>::value,
                           "\n[SplineOptimizer Error] 'IntegralCostFunc' signature mismatch.\n");
@@ -765,6 +870,7 @@ namespace SplineTrajectory
                           "The Executor must implement:\n"
                           "  void operator()(int start, int end, Func&& f) const;\n"
                           "where 'f' is a callable accepting an 'int' index.\n");
+            ensureLayoutCache();
 
             Workspace& ws_ref = (ws != nullptr) ? *ws : *getOrCreateInternalWorkspace();
             ws_ref.resize(num_segments_);
@@ -772,30 +878,20 @@ namespace SplineTrajectory
             double total_cost = 0.0;
             int n_inner = std::max(0, num_segments_ - 1);
 
-            int offset = 0;
-
             for (int i = 0; i < num_segments_; ++i)
-                ws_ref.cache_times[i] = active_time_map_->toTime(x(offset++));
-
-            auto is_spatial_optimized = [&](int idx) {
-                if (idx == 0) return flags_.start_p;
-                if (idx == num_segments_) return flags_.end_p;
-                return true;
-            };
-
-            for (int i = 0; i <= num_segments_; ++i)
             {
-                if (is_spatial_optimized(i)) {
-                    int dof = active_spatial_map_->getUnconstrainedDim(i);
-                    Eigen::VectorXd xi = x.segment(offset, dof);
-                    ws_ref.cache_waypoints[i] = active_spatial_map_->toPhysical(xi, i);
-                    offset += dof;
-                } else {
-                    ws_ref.cache_waypoints[i] = ref_waypoints_[i];
-                }
+                ws_ref.cache_times[i] = active_time_map_->toTime(x(i));
+            }
+
+            ws_ref.cache_waypoints = ref_waypoints_;
+            for (const auto &var : spatial_layout_)
+            {
+                ws_ref.cache_waypoints.row(var.point_index) =
+                    active_spatial_map_->toPhysical(x.segment(var.offset, var.dof), var.point_index).transpose();
             }
 
             BoundaryConditions<DIM> current_bc = ref_bc_;
+            int offset = derivatives_offset_;
             auto apply_derivatives_forward = [&](auto&& op) {
 
                 if (flags_.start_v) op(current_bc.start_velocity);
@@ -862,40 +958,39 @@ namespace SplineTrajectory
                 if constexpr (SplineType::ORDER >= 7) ws_ref.grads.end.j += rho_energy_ * ws_ref.energy_grads.end.j;
             }
 
-            offset = 0;
-
             // Time gradient: backward through time map
             for (int i = 0; i < num_segments_; ++i)
             {
-                double tau = x(offset);
+                double tau = x(i);
                 double T = ws_ref.cache_times[i];
                 double gradT = ws_ref.grads.times(i);
-                grad_out(offset) = active_time_map_->backward(tau, T, gradT);
-                offset++;
+                grad_out(i) = active_time_map_->backward(tau, T, gradT);
             }
 
             // Spatial gradient: unified loop with backward mapping
-            for (int i = 0; i <= num_segments_; ++i)
+            for (const auto &var : spatial_layout_)
             {
-                if (is_spatial_optimized(i)) {
-                    int dof = active_spatial_map_->getUnconstrainedDim(i);
-                    Eigen::VectorXd xi = x.segment(offset, dof);
+                const auto xi = x.segment(var.offset, var.dof);
 
-                    Eigen::VectorXd grad_p_phys;
-                    if (i == 0) {
-                        grad_p_phys = ws_ref.grads.start.p;
-                    } else if (i == num_segments_) {
-                        grad_p_phys = ws_ref.grads.end.p;
-                    } else {
-                        grad_p_phys = ws_ref.grads.inner_points.row(i - 1).transpose();
-                    }
-
-                    // Chain Rule: dCost/dxi = dCost/dp * dp/dxi
-                    grad_out.segment(offset, dof) = active_spatial_map_->backwardGrad(xi, grad_p_phys, i);
-                    offset += dof;
+                if (var.point_index == 0)
+                {
+                    grad_out.segment(var.offset, var.dof) =
+                        active_spatial_map_->backwardGrad(xi, ws_ref.grads.start.p, 0);
+                }
+                else if (var.point_index == num_segments_)
+                {
+                    grad_out.segment(var.offset, var.dof) =
+                        active_spatial_map_->backwardGrad(xi, ws_ref.grads.end.p, var.point_index);
+                }
+                else
+                {
+                    VectorType inner_grad = ws_ref.grads.inner_points.row(var.point_index - 1).transpose();
+                    grad_out.segment(var.offset, var.dof) =
+                        active_spatial_map_->backwardGrad(xi, inner_grad, var.point_index);
                 }
             }
 
+            offset = derivatives_offset_;
             auto apply_derivatives_backward = [&](auto&& op) {
                 if (flags_.start_v) op(ws_ref.grads.start.v);
                 if constexpr (SplineType::ORDER >= 5) if (flags_.start_a) op(ws_ref.grads.start.a);
@@ -1059,36 +1154,8 @@ namespace SplineTrajectory
         
         int calculateDimension() const
         {
-            int dim = 0;
-
-            dim += num_segments_;
-
-            auto is_spatial_optimized = [&](int idx) {
-                if (idx == 0) return flags_.start_p;
-                if (idx == num_segments_) return flags_.end_p;
-                return true; 
-            };
-
-            for (int i = 0; i <= num_segments_; ++i)
-            {
-                if (is_spatial_optimized(i)) {
-                    dim += active_spatial_map_->getUnconstrainedDim(i);
-                }
-            }
-
-            auto apply_derivatives = [&](auto&& op) {
-                if (flags_.start_v) op();
-                if constexpr (SplineType::ORDER >= 5) if (flags_.start_a) op();
-                if constexpr (SplineType::ORDER >= 7) if (flags_.start_j) op();
-                
-                if (flags_.end_v) op();
-                if constexpr (SplineType::ORDER >= 5) if (flags_.end_a) op();
-                if constexpr (SplineType::ORDER >= 7) if (flags_.end_j) op();
-            };
-
-            apply_derivatives([&]() { dim += DIM; });
-
-            return dim;
+            ensureLayoutCache();
+            return total_dimension_;
         }
 
         template <typename IntegralFunc, typename Executor>
@@ -1097,14 +1164,13 @@ namespace SplineTrajectory
         {
             const auto &coeffs = ws.spline.getTrajectory().getCoefficients();
             
-            std::vector<double> segment_start_times(num_segments_);
             double running_time = start_time_;
             for(int i = 0; i < num_segments_; ++i) {
-                segment_start_times[i] = running_time;
+                ws.segment_start_times[i] = running_time;
                 running_time += ws.cache_times[i];
             }
 
-            std::vector<double> segment_costs(num_segments_, 0.0);
+            std::fill(ws.segment_costs.begin(), ws.segment_costs.end(), 0.0);
 
             ws.explicit_time_grad_buffer.setZero();
 
@@ -1127,7 +1193,7 @@ namespace SplineTrajectory
                 local_acc_gdC.setZero();
 
                 Eigen::Matrix<double, 1, SplineType::COEFF_NUM> b_p, b_v, b_a, b_j, b_s, b_c;
-                double current_segment_start_time = segment_start_times[i];
+                double current_segment_start_time = ws.segment_start_times[i];
 
                 for (int k = 0; k <= K; ++k)
                 {
@@ -1177,7 +1243,7 @@ namespace SplineTrajectory
                     local_acc_explicit_time_grad += gt * common_weight;
                 }
 
-                segment_costs[i] = local_acc_cost;
+                ws.segment_costs[i] = local_acc_cost;
                 
                 gdT(i) += local_acc_gdT;
                 ws.explicit_time_grad_buffer(i) += local_acc_explicit_time_grad;
@@ -1186,7 +1252,7 @@ namespace SplineTrajectory
             });
 
             for(int i = 0; i < num_segments_; ++i) {
-                cost += segment_costs[i];
+                cost += ws.segment_costs[i];
             }
 
             double accumulator = 0.0;

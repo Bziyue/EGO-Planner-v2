@@ -33,11 +33,11 @@ namespace ego_planner
     piece_num_ = initT.size();
 
     // Setup SplineOptimizer
-    WaypointsVec waypoints;
-    waypoints.push_back(iniState.col(0));
+    WaypointsMat waypoints(initInnerPts.cols() + 2, 3);
+    waypoints.row(0) = iniState.col(0).transpose();
     for (int i = 0; i < initInnerPts.cols(); ++i)
-      waypoints.push_back(initInnerPts.col(i));
-    waypoints.push_back(finState.col(0));
+      waypoints.row(i + 1) = initInnerPts.col(i).transpose();
+    waypoints.row(initInnerPts.cols() + 1) = finState.col(0).transpose();
 
     BCs bc;
     bc.start_velocity = iniState.col(1);
@@ -60,7 +60,7 @@ namespace ego_planner
     flags.start_a = false;
     flags.end_a = false;
     splineOpt_.setOptimizationFlags(flags);
-    splineOpt_.setEnergyWeights(1.0);
+    splineOpt_.setEnergyWeights(rho_energy_);
     splineOpt_.setIntegralNumSteps(cps_num_prePiece_);
 
     // Generate initial guess
@@ -1010,6 +1010,7 @@ namespace ego_planner
     nh.param("optimization/weight_feasibility", wei_feas_, -1.0);
     nh.param("optimization/weight_sqrvariance", wei_sqrvar_, -1.0);
     nh.param("optimization/weight_time", wei_time_, -1.0);
+    nh.param("optimization/weight_energy", rho_energy_, 1.0);
     nh.param("optimization/obstacle_clearance", obs_clearance_, -1.0);
     nh.param("optimization/obstacle_clearance_soft", obs_clearance_soft_, -1.0);
     nh.param("optimization/swarm_clearance", swarm_clearance_, -1.0);

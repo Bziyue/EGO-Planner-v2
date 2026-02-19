@@ -12,7 +12,7 @@ using std::vector;
 namespace ego_planner
 {
   // Type alias for the 3D piecewise polynomial trajectory
-  using PPoly3D = SplineTrajectory::PPolyND<3>;
+  using PPoly3D = SplineTrajectory::PPolyND<3, 6>;
 
   typedef std::vector<std::vector<std::pair<double, Eigen::Vector3d>>> PtsChk_t;
 
