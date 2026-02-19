@@ -20,7 +20,6 @@
 #include <plan_manage/planner_manager.h>
 #include <traj_utils/planning_visualization.h>
 #include <traj_utils/PolyTraj.h>
-#include <traj_utils/MINCOTraj.h>
 
 using std::vector;
 
@@ -114,8 +113,8 @@ namespace ego_planner
     void mandatoryStopCallback(const std_msgs::Empty &msg);
     void odometryCallback(const nav_msgs::OdometryConstPtr &msg);
     void triggerCallback(const geometry_msgs::PoseStampedPtr &msg);
-    void RecvBroadcastMINCOTrajCallback(const traj_utils::MINCOTrajConstPtr &msg);
-    void polyTraj2ROSMsg(traj_utils::PolyTraj &poly_msg, traj_utils::MINCOTraj &MINCO_msg);
+    void RecvBroadcastPolyTrajCallback(const traj_utils::PolyTrajConstPtr &msg);
+    void polyTraj2ROSMsg(traj_utils::PolyTraj &poly_msg);
 
     /* ground height measurement */
     bool measureGroundHeight(double &height);

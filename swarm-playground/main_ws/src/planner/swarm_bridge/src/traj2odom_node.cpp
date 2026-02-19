@@ -4,15 +4,12 @@
 #include <string.h>
 #include <iostream>
 #include <nav_msgs/Odometry.h>
-#include <traj_utils/MINCOTraj.h>
+#include <traj_utils/PolyTraj.h>
 #include <SplineTrajectory/SplineTrajectory.hpp>
 
 using namespace std;
 
 using PPoly3D = SplineTrajectory::PPolyND<3, 6>;
-using BCs = SplineTrajectory::BoundaryConditions<3>;
-using WaypointsMat = typename SplineTrajectory::QuinticSplineND<3>::MatrixType;
-
 struct Traj_t
 {
   PPoly3D traj;
@@ -26,7 +23,7 @@ vector<Traj_t> trajs_;
 ros::Subscriber one_traj_sub_;
 ros::Publisher other_odoms_pub_;
 
-void one_traj_sub_cb(const traj_utils::MINCOTrajPtr &msg)
+void one_traj_sub_cb(const traj_utils::PolyTrajPtr &msg)
 {
 
   const int recv_id = msg->drone_id;
@@ -41,7 +38,10 @@ void one_traj_sub_cb(const traj_utils::MINCOTrajPtr &msg)
     ROS_ERROR("Only support trajectory order equals 5 now!");
     return;
   }
-  if (msg->duration.size() != (msg->inner_x.size() + 1))
+  if (msg->duration.empty() ||
+      msg->coef_x.size() != msg->coef_y.size() ||
+      msg->coef_x.size() != msg->coef_z.size() ||
+      msg->duration.size() * (msg->order + 1) != msg->coef_x.size())
   {
     ROS_ERROR("WRONG trajectory parameters.");
     return;
@@ -80,43 +80,29 @@ void one_traj_sub_cb(const traj_utils::MINCOTrajPtr &msg)
     }
   }
 
-  /* Store data */;
-  int piece_nums = msg->duration.size();
-  Eigen::Matrix<double, 3, 3> headState, tailState;
-  headState << msg->start_p[0], msg->start_v[0], msg->start_a[0],
-      msg->start_p[1], msg->start_v[1], msg->start_a[1],
-      msg->start_p[2], msg->start_v[2], msg->start_a[2];
-  tailState << msg->end_p[0], msg->end_v[0], msg->end_a[0],
-      msg->end_p[1], msg->end_v[1], msg->end_a[1],
-      msg->end_p[2], msg->end_v[2], msg->end_a[2];
-  Eigen::MatrixXd innerPts(3, piece_nums - 1);
-  Eigen::VectorXd durations(piece_nums);
-  for (int i = 0; i < piece_nums - 1; i++)
-    innerPts.col(i) << msg->inner_x[i], msg->inner_y[i], msg->inner_z[i];
-  for (int i = 0; i < piece_nums; i++)
-    durations(i) = msg->duration[i];
+  /* Store data */
+  const int piece_nums = static_cast<int>(msg->duration.size());
+  const int num_coeffs = msg->order + 1;
 
-  // Build trajectory using QuinticSplineND
-  WaypointsMat waypoints(piece_nums + 1, 3);
-  waypoints.row(0) = headState.col(0).transpose();
-  for (int i = 0; i < piece_nums - 1; ++i)
-    waypoints.row(i + 1) = innerPts.col(i).transpose();
-  waypoints.row(piece_nums) = tailState.col(0).transpose();
-
-  BCs bc;
-  bc.start_velocity = headState.col(1);
-  bc.start_acceleration = headState.col(2);
-  bc.end_velocity = tailState.col(1);
-  bc.end_acceleration = tailState.col(2);
-
-  std::vector<double> time_segs(piece_nums);
+  std::vector<double> breakpoints(piece_nums + 1);
+  breakpoints[0] = 0.0;
   for (int i = 0; i < piece_nums; ++i)
-    time_segs[i] = durations(i);
+    breakpoints[i + 1] = breakpoints[i] + msg->duration[i];
 
-  SplineTrajectory::QuinticSplineND<3> spline;
-  spline.update(time_segs, waypoints, 0.0, bc);
+  using MatrixType = Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor>;
+  MatrixType coefficients(piece_nums * num_coeffs, 3);
+  for (int i = 0; i < piece_nums; ++i)
+  {
+    const int base = i * num_coeffs;
+    for (int j = 0; j < num_coeffs; ++j)
+    {
+      coefficients(base + j, 0) = msg->coef_x[base + j];
+      coefficients(base + j, 1) = msg->coef_y[base + j];
+      coefficients(base + j, 2) = msg->coef_z[base + j];
+    }
+  }
 
-  trajs_[recv_id].traj = spline.getTrajectoryCopy();
+  trajs_[recv_id].traj = PPoly3D(breakpoints, coefficients, num_coeffs);
   trajs_[recv_id].start_time = msg->start_time;
   trajs_[recv_id].valid = true;
   trajs_[recv_id].duration = trajs_[recv_id].traj.getDuration();

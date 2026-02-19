@@ -21,7 +21,6 @@ add_message_files(
   FILES
   DataDisp.msg
   PolyTraj.msg
-  MINCOTraj.msg
   )
   
 # Generate added messages and services with any dependencies listed here

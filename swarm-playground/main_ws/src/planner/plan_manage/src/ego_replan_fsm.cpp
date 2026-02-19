@@ -31,34 +31,6 @@ namespace ego_planner
     return durs;
   }
 
-  // Helper: generate trajectory from head/tail state, inner points, durations
-  static PPoly3D buildSplineTraj(
-      const Eigen::Matrix<double, 3, 3> &headState,
-      const Eigen::Matrix<double, 3, 3> &tailState,
-      const Eigen::MatrixXd &innerPts,
-      const Eigen::VectorXd &durations)
-  {
-    WaypointsMat waypoints(innerPts.cols() + 2, 3);
-    waypoints.row(0) = headState.col(0).transpose();
-    for (int i = 0; i < innerPts.cols(); ++i)
-      waypoints.row(i + 1) = innerPts.col(i).transpose();
-    waypoints.row(innerPts.cols() + 1) = tailState.col(0).transpose();
-
-    BCs bc;
-    bc.start_velocity = headState.col(1);
-    bc.start_acceleration = headState.col(2);
-    bc.end_velocity = tailState.col(1);
-    bc.end_acceleration = tailState.col(2);
-
-    std::vector<double> time_segs(durations.size());
-    for (int i = 0; i < durations.size(); ++i)
-      time_segs[i] = durations(i);
-
-    SplineTrajectory::QuinticSplineND<3> spline;
-    spline.update(time_segs, waypoints, 0.0, bc);
-    return spline.getTrajectoryCopy();
-  }
-
   // Helper: sample K points per piece from trajectory (for proximity check)
   static Eigen::MatrixXd sampleConstraintPoints(const PPoly3D &traj, int K)
   {
@@ -127,12 +99,11 @@ namespace ego_planner
     odom_sub_ = nh.subscribe("odom_world", 1, &EGOReplanFSM::odometryCallback, this);
     mandatory_stop_sub_ = nh.subscribe("mandatory_stop", 1, &EGOReplanFSM::mandatoryStopCallback, this);
 
-    /* Use MINCO trajectory to minimize the message size in wireless communication */
-    broadcast_ploytraj_pub_ = nh.advertise<traj_utils::MINCOTraj>("planning/broadcast_traj_send", 10);
-    broadcast_ploytraj_sub_ = nh.subscribe<traj_utils::MINCOTraj>("planning/broadcast_traj_recv", 100,
-                                                                  &EGOReplanFSM::RecvBroadcastMINCOTrajCallback,
-                                                                  this,
-                                                                  ros::TransportHints().tcpNoDelay());
+    broadcast_ploytraj_pub_ = nh.advertise<traj_utils::PolyTraj>("planning/broadcast_traj_send", 10);
+    broadcast_ploytraj_sub_ = nh.subscribe<traj_utils::PolyTraj>("planning/broadcast_traj_recv", 100,
+                                                                 &EGOReplanFSM::RecvBroadcastPolyTrajCallback,
+                                                                 this,
+                                                                 ros::TransportHints().tcpNoDelay());
 
     poly_traj_pub_ = nh.advertise<traj_utils::PolyTraj>("planning/trajectory", 10);
     data_disp_pub_ = nh.advertise<traj_utils::DataDisp>("planning/data_display", 100);
@@ -491,10 +462,9 @@ namespace ego_planner
     planner_manager_->EmergencyStop(stop_pos);
 
     traj_utils::PolyTraj poly_msg;
-    traj_utils::MINCOTraj MINCO_msg;
-    polyTraj2ROSMsg(poly_msg, MINCO_msg);
+    polyTraj2ROSMsg(poly_msg);
     poly_traj_pub_.publish(poly_msg);
-    broadcast_ploytraj_pub_.publish(MINCO_msg);
+    broadcast_ploytraj_pub_.publish(poly_msg);
 
     return true;
   }
@@ -519,10 +489,9 @@ namespace ego_planner
     {
 
       traj_utils::PolyTraj poly_msg;
-      traj_utils::MINCOTraj MINCO_msg;
-      polyTraj2ROSMsg(poly_msg, MINCO_msg);
+      polyTraj2ROSMsg(poly_msg);
       poly_traj_pub_.publish(poly_msg);
-      broadcast_ploytraj_pub_.publish(MINCO_msg);
+      broadcast_ploytraj_pub_.publish(poly_msg);
     }
 
     return plan_success;
@@ -735,7 +704,7 @@ namespace ego_planner
     cout << "Triggered!" << endl;
   }
 
-  void EGOReplanFSM::RecvBroadcastMINCOTrajCallback(const traj_utils::MINCOTrajConstPtr &msg)
+  void EGOReplanFSM::RecvBroadcastPolyTrajCallback(const traj_utils::PolyTrajConstPtr &msg)
   {
     const size_t recv_id = (size_t)msg->drone_id;
     if ((int)recv_id == planner_manager_->pp_.drone_id) // myself
@@ -751,7 +720,10 @@ namespace ego_planner
       ROS_ERROR("Only support trajectory order equals 5 now!");
       return;
     }
-    if (msg->duration.size() != (msg->inner_x.size() + 1))
+    if (msg->duration.empty() ||
+        msg->coef_x.size() != msg->coef_y.size() ||
+        msg->coef_x.size() != msg->coef_z.size() ||
+        msg->duration.size() * (msg->order + 1) != msg->coef_x.size())
     {
       ROS_ERROR("WRONG trajectory parameters.");
       return;
@@ -801,22 +773,26 @@ namespace ego_planner
 
     /* Parse and store data */
 
-    int piece_nums = msg->duration.size();
-    Eigen::Matrix<double, 3, 3> headState, tailState;
-    headState << msg->start_p[0], msg->start_v[0], msg->start_a[0],
-        msg->start_p[1], msg->start_v[1], msg->start_a[1],
-        msg->start_p[2], msg->start_v[2], msg->start_a[2];
-    tailState << msg->end_p[0], msg->end_v[0], msg->end_a[0],
-        msg->end_p[1], msg->end_v[1], msg->end_a[1],
-        msg->end_p[2], msg->end_v[2], msg->end_a[2];
-    Eigen::MatrixXd innerPts(3, piece_nums - 1);
-    Eigen::VectorXd durations(piece_nums);
-    for (int i = 0; i < piece_nums - 1; i++)
-      innerPts.col(i) << msg->inner_x[i], msg->inner_y[i], msg->inner_z[i];
-    for (int i = 0; i < piece_nums; i++)
-      durations(i) = msg->duration[i];
+    const int piece_nums = static_cast<int>(msg->duration.size());
+    const int num_coeffs = msg->order + 1;
+    std::vector<double> breakpoints(piece_nums + 1);
+    breakpoints[0] = 0.0;
+    for (int i = 0; i < piece_nums; ++i)
+      breakpoints[i + 1] = breakpoints[i] + msg->duration[i];
 
-    PPoly3D trajectory = buildSplineTraj(headState, tailState, innerPts, durations);
+    using MatrixType = Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor>;
+    MatrixType coefficients(piece_nums * num_coeffs, 3);
+    for (int i = 0; i < piece_nums; ++i)
+    {
+      const int base = i * num_coeffs;
+      for (int j = 0; j < num_coeffs; ++j)
+      {
+        coefficients(base + j, 0) = msg->coef_x[base + j];
+        coefficients(base + j, 1) = msg->coef_y[base + j];
+        coefficients(base + j, 2) = msg->coef_z[base + j];
+      }
+    }
+    PPoly3D trajectory(breakpoints, coefficients, num_coeffs);
 
     /* Ignore the trajectories that are far away */
     Eigen::MatrixXd cps_chk = sampleConstraintPoints(trajectory, 5); // K = 5, such accuracy is sufficient
@@ -868,7 +844,7 @@ namespace ego_planner
     }
   }
 
-  void EGOReplanFSM::polyTraj2ROSMsg(traj_utils::PolyTraj &poly_msg, traj_utils::MINCOTraj &MINCO_msg)
+  void EGOReplanFSM::polyTraj2ROSMsg(traj_utils::PolyTraj &poly_msg)
   {
 
     auto data = &planner_manager_->traj_.local_traj;
@@ -883,6 +859,7 @@ namespace ego_planner
     poly_msg.coef_x.resize(6 * piece_num);
     poly_msg.coef_y.resize(6 * piece_num);
     poly_msg.coef_z.resize(6 * piece_num);
+    poly_msg.des_clearance = planner_manager_->getSwarmClearance();
     for (int i = 0; i < piece_num; ++i)
     {
       poly_msg.duration[i] = durs(i);
@@ -899,89 +876,6 @@ namespace ego_planner
       }
     }
 
-    // Optional debug: verify PolyTraj message encoding matches internal trajectory.
-    {
-      bool check_poly_msg = false;
-      ros::param::param("debug/check_poly_msg", check_poly_msg, false);
-      if (check_poly_msg)
-      {
-        const int num_coeffs = 6;
-        std::vector<double> breakpoints(piece_num + 1);
-        breakpoints[0] = 0.0;
-        for (int i = 0; i < piece_num; ++i)
-          breakpoints[i + 1] = breakpoints[i] + poly_msg.duration[i];
-
-        using MatrixType = Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor>;
-        MatrixType coefficients(piece_num * num_coeffs, 3);
-        for (int i = 0; i < piece_num; ++i)
-        {
-          int i6 = i * 6;
-          for (int j = 0; j < 6; ++j)
-          {
-            coefficients(i * num_coeffs + j, 0) = poly_msg.coef_x[i6 + j];
-            coefficients(i * num_coeffs + j, 1) = poly_msg.coef_y[i6 + j];
-            coefficients(i * num_coeffs + j, 2) = poly_msg.coef_z[i6 + j];
-          }
-        }
-
-        PPoly3D msg_traj(breakpoints, coefficients, num_coeffs);
-        double t0 = data->traj.getStartTime();
-        double t1 = data->traj.getEndTime();
-        double max_dev = 0.0;
-        const int samples = 50;
-        for (int i = 0; i <= samples; ++i)
-        {
-          double s = static_cast<double>(i) / samples;
-          double t = t0 + (t1 - t0) * s;
-          Eigen::Vector3d p_ref = data->traj.evaluate(t, SplineTrajectory::Deriv::Pos);
-          Eigen::Vector3d p_msg = msg_traj.evaluate(t, SplineTrajectory::Deriv::Pos);
-          double d = (p_ref - p_msg).norm();
-          if (d > max_dev)
-            max_dev = d;
-        }
-
-        ROS_WARN_STREAM("[poly_msg_check] drone=" << planner_manager_->pp_.drone_id
-                                                    << " max_dev=" << max_dev
-                                                    << " piece_num=" << piece_num);
-      }
-    }
-
-    MINCO_msg.drone_id = planner_manager_->pp_.drone_id;
-    MINCO_msg.traj_id = data->traj_id;
-    MINCO_msg.start_time = ros::Time(data->start_time);
-    MINCO_msg.order = 5; // todo, only support order = 5 now.
-    MINCO_msg.duration.resize(piece_num);
-    MINCO_msg.des_clearance = planner_manager_->getSwarmClearance();
-
-    double t_start = data->traj.getStartTime();
-    double t_end = data->traj.getEndTime();
-    Eigen::Vector3d vec;
-    vec = data->traj.evaluate(t_start, SplineTrajectory::Deriv::Pos);
-    MINCO_msg.start_p[0] = vec(0), MINCO_msg.start_p[1] = vec(1), MINCO_msg.start_p[2] = vec(2);
-    vec = data->traj.evaluate(t_start, SplineTrajectory::Deriv::Vel);
-    MINCO_msg.start_v[0] = vec(0), MINCO_msg.start_v[1] = vec(1), MINCO_msg.start_v[2] = vec(2);
-    vec = data->traj.evaluate(t_start, SplineTrajectory::Deriv::Acc);
-    MINCO_msg.start_a[0] = vec(0), MINCO_msg.start_a[1] = vec(1), MINCO_msg.start_a[2] = vec(2);
-    vec = data->traj.evaluate(t_end, SplineTrajectory::Deriv::Pos);
-    MINCO_msg.end_p[0] = vec(0), MINCO_msg.end_p[1] = vec(1), MINCO_msg.end_p[2] = vec(2);
-    vec = data->traj.evaluate(t_end, SplineTrajectory::Deriv::Vel);
-    MINCO_msg.end_v[0] = vec(0), MINCO_msg.end_v[1] = vec(1), MINCO_msg.end_v[2] = vec(2);
-    vec = data->traj.evaluate(t_end, SplineTrajectory::Deriv::Acc);
-    MINCO_msg.end_a[0] = vec(0), MINCO_msg.end_a[1] = vec(1), MINCO_msg.end_a[2] = vec(2);
-    MINCO_msg.inner_x.resize(piece_num - 1);
-    MINCO_msg.inner_y.resize(piece_num - 1);
-    MINCO_msg.inner_z.resize(piece_num - 1);
-    // Get inner waypoints from breakpoints
-    const auto &bp = data->traj.getBreakpoints();
-    for (int i = 0; i < piece_num - 1; i++)
-    {
-      Eigen::Vector3d pt = data->traj.evaluate(bp[i + 1], SplineTrajectory::Deriv::Pos);
-      MINCO_msg.inner_x[i] = pt(0);
-      MINCO_msg.inner_y[i] = pt(1);
-      MINCO_msg.inner_z[i] = pt(2);
-    }
-    for (int i = 0; i < piece_num; i++)
-      MINCO_msg.duration[i] = durs[i];
   }
 
   bool EGOReplanFSM::measureGroundHeight(double &height)

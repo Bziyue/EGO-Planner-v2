@@ -1,21 +1,9 @@
 #include "optimizer/poly_traj_optimizer.h"
-#include <fstream>
-#include <sstream>
-#include <iomanip>
 
 using namespace std;
 
 namespace ego_planner
 {
-  static void appendCostLog(const std::string &line)
-  {
-    std::string path;
-    ros::param::param("debug/cost_log_path", path, std::string("/tmp/ego_cost.log"));
-    std::ofstream ofs(path, std::ios::app);
-    if (ofs.is_open())
-      ofs << line << std::endl;
-  }
-
   // =====================================================
   //  Helpers for discrete variance gradient (same-iteration)
   // =====================================================
@@ -165,112 +153,27 @@ namespace ego_planner
 
     // Distance variance cost on constraint points (post-processing).
     // Apply its gradient in the SAME iteration to keep L-BFGS consistent.
-    double var_cost = 0.0;
-    bool disable_var = false;
-    ros::param::param("debug/disable_variance_grad", disable_var, false);
-    if (!disable_var && opt->wei_sqrvar_ > 0 && opt->cps_.cp_size > 1)
+    if (opt->wei_sqrvar_ > 0 && opt->cps_.cp_size > 1)
     {
       Eigen::MatrixXd gdp;
-      opt->distanceSqrVarianceWithGradCost2p(opt->cps_.points, gdp, var_cost);
-      total_cost += var_cost;
+      double var_cost_value = 0.0;
+      opt->distanceSqrVarianceWithGradCost2p(opt->cps_.points, gdp, var_cost_value);
+      total_cost += var_cost_value;
 
       // Inject discrete variance gradient via a second pass (no time/energy cost).
-      VarianceGradCostFunction var_cost;
-      var_cost.variance_grad = &gdp;
-      var_cost.segment_dt = &opt->integral_cost_func_.segment_dt_;
-      var_cost.cps_per_piece = opt->cps_num_prePiece_;
+      VarianceGradCostFunction var_cost_func;
+      var_cost_func.variance_grad = &gdp;
+      var_cost_func.segment_dt = &opt->integral_cost_func_.segment_dt_;
+      var_cost_func.cps_per_piece = opt->cps_num_prePiece_;
 
       Eigen::VectorXd grad_var = Eigen::VectorXd::Zero(n);
       ZeroTimeCostFunction zero_time;
       double rho_backup = opt->rho_energy_;
       opt->splineOpt_.setEnergyWeights(0.0);
-      opt->splineOpt_.evaluate(x_vec, grad_var, zero_time, var_cost);
+      opt->splineOpt_.evaluate(x_vec, grad_var, zero_time, var_cost_func);
       opt->splineOpt_.setEnergyWeights(rho_backup);
 
       grad_vec += grad_var;
-    }
-
-    // Optional cost breakdown logging (only once per optimization)
-    bool log_cost_breakdown = false;
-    ros::param::param("debug/log_cost_breakdown", log_cost_breakdown, false);
-    if (log_cost_breakdown && opt->iter_num_ == 0)
-    {
-      // Compute time cost
-      SplineTrajectory::QuadInvTimeMap time_map;
-      double sum_T = 0.0;
-      for (int i = 0; i < opt->piece_num_; ++i)
-        sum_T += time_map.toTime(x_vec(i));
-      double time_cost = opt->wei_time_ * sum_T;
-
-      // Compute energy cost
-      double energy_cost = 0.0;
-      const SplineTraj *opt_spline = opt->splineOpt_.getOptimalSpline();
-      if (opt_spline)
-        energy_cost = opt->rho_energy_ * opt_spline->getEnergy();
-
-      // Backup weights
-      double wei_obs = opt->integral_cost_func_.wei_obs;
-      double wei_obs_soft = opt->integral_cost_func_.wei_obs_soft;
-      double wei_swarm = opt->integral_cost_func_.wei_swarm;
-      double wei_feas = opt->integral_cost_func_.wei_feas;
-
-      auto eval_integral = [&]() {
-        Eigen::VectorXd dummy_grad = Eigen::VectorXd::Zero(n);
-        ZeroTimeCostFunction zero_time;
-        opt->integral_cost_func_.resetAccumulation();
-        double rho_backup = opt->rho_energy_;
-        opt->splineOpt_.setEnergyWeights(0.0);
-        double cost = opt->splineOpt_.evaluate(x_vec, dummy_grad, zero_time, opt->integral_cost_func_);
-        opt->splineOpt_.setEnergyWeights(rho_backup);
-        return cost;
-      };
-
-      // Obstacle only
-      opt->integral_cost_func_.wei_obs = wei_obs;
-      opt->integral_cost_func_.wei_obs_soft = wei_obs_soft;
-      opt->integral_cost_func_.wei_swarm = 0.0;
-      opt->integral_cost_func_.wei_feas = 0.0;
-      double obs_cost = eval_integral();
-
-      // Swarm only
-      opt->integral_cost_func_.wei_obs = 0.0;
-      opt->integral_cost_func_.wei_obs_soft = 0.0;
-      opt->integral_cost_func_.wei_swarm = wei_swarm;
-      opt->integral_cost_func_.wei_feas = 0.0;
-      double swarm_cost = eval_integral();
-
-      // Feasibility only
-      opt->integral_cost_func_.wei_obs = 0.0;
-      opt->integral_cost_func_.wei_obs_soft = 0.0;
-      opt->integral_cost_func_.wei_swarm = 0.0;
-      opt->integral_cost_func_.wei_feas = wei_feas;
-      double feas_cost = eval_integral();
-
-      // Restore weights
-      opt->integral_cost_func_.wei_obs = wei_obs;
-      opt->integral_cost_func_.wei_obs_soft = wei_obs_soft;
-      opt->integral_cost_func_.wei_swarm = wei_swarm;
-      opt->integral_cost_func_.wei_feas = wei_feas;
-
-      std::ostringstream ss;
-      ss.setf(std::ios::fixed);
-      int swarm_n = (opt->swarm_trajs_ ? static_cast<int>(opt->swarm_trajs_->size()) : -1);
-      ss << "[cost_breakdown] t=" << ros::Time::now().toSec()
-         << " drone=" << opt->drone_id_
-         << " total=" << std::setprecision(6) << total_cost
-         << " time=" << std::setprecision(6) << time_cost
-         << " energy=" << std::setprecision(6) << energy_cost
-         << " obs=" << std::setprecision(6) << obs_cost
-         << " swarm=" << std::setprecision(6) << swarm_cost
-         << " feas=" << std::setprecision(6) << feas_cost
-         << " var=" << std::setprecision(6) << var_cost
-         << " max_v=" << opt->max_vel_
-         << " max_a=" << opt->max_acc_
-         << " max_j=" << opt->max_jer_
-         << " K=" << opt->cps_num_prePiece_
-         << " N=" << opt->piece_num_
-         << " swarm_n=" << swarm_n;
-      appendCostLog(ss.str());
     }
 
     // Copy gradients back to raw pointer

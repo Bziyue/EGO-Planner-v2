@@ -5,7 +5,7 @@
 #include <iostream>
 #include <nav_msgs/Odometry.h>
 #include <sensor_msgs/Joy.h>
-#include <traj_utils/MINCOTraj.h>
+#include <traj_utils/PolyTraj.h>
 #include <quadrotor_msgs/GoalSet.h>
 #include <sensor_msgs/PointCloud2.h>
 #include <unistd.h>
@@ -126,7 +126,7 @@ void object_odom_sub_udp_cb(const nav_msgs::OdometryPtr &msg)
   send_to_all_groundstation_except_me("/object_odom",*msg);// Only send to ground stations.
 }
 
-void one_traj_sub_cb(const traj_utils::MINCOTrajPtr &msg)
+void one_traj_sub_cb(const traj_utils::PolyTrajPtr &msg)
 {
   one_traj_pub_.publish(msg);  // Send to myself.
   if (bridge->send_msg_to_all("/traj_from_planner",*msg))
@@ -208,9 +208,9 @@ void goal_bridge_cb(int ID, ros::SerializedMessage& m)
 
 void traj_bridge_cb(int ID, ros::SerializedMessage& m)
 {
-  traj_utils::MINCOTraj MINCOTraj_msg_;
-  ros::serialization::deserializeMessage(m,MINCOTraj_msg_);
-  one_traj_pub_.publish(MINCOTraj_msg_);
+  traj_utils::PolyTraj poly_traj_msg;
+  ros::serialization::deserializeMessage(m, poly_traj_msg);
+  one_traj_pub_.publish(poly_traj_msg);
 }
 
 void joystick_bridge_cb(int ID, ros::SerializedMessage& m)
@@ -288,7 +288,7 @@ int main(int argc, char **argv)
   register_callbak_to_all_drones("/object_odom",object_odom_bridge_cb);
 
   one_traj_sub_ = nh.subscribe("/broadcast_traj_from_planner", 100, one_traj_sub_cb, ros::TransportHints().tcpNoDelay());
-  one_traj_pub_ = nh.advertise<traj_utils::MINCOTraj>("/broadcast_traj_to_planner", 100);
+  one_traj_pub_ = nh.advertise<traj_utils::PolyTraj>("/broadcast_traj_to_planner", 100);
   bridge->register_callback_for_all("/traj_from_planner",traj_bridge_cb);
 
   joystick_sub_ = nh.subscribe("/joystick_from_users", 100, joystick_sub_cb, ros::TransportHints().tcpNoDelay());
