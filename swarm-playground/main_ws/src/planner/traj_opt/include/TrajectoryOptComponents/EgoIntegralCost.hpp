@@ -11,7 +11,7 @@ class EgoIntegralCost
 public:
   GridMap::Ptr grid_map;
   ego_planner::ConstraintPoints *cps;
-  SwarmTrajData *swarm_trajs;
+  ego_planner::SwarmTrajData *swarm_trajs;
   double wei_obs, wei_obs_soft, wei_swarm, wei_feas, wei_sqrvar;
   double obs_clearance, obs_clearance_soft, swarm_clearance;
   double max_vel, max_acc, max_jer;
