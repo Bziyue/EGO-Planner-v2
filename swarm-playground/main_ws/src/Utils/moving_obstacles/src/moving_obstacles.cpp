@@ -7,7 +7,7 @@
 #include <iostream>
 #include <sensor_msgs/Joy.h>
 #include <nav_msgs/Odometry.h>
-#include <traj_utils/MINCOTraj.h>
+#include <traj_utils/PolyTraj.h>
 #include <traj_utils/planning_visualization.h>
 #include <optimizer/poly_traj_utils.hpp>
 
@@ -116,44 +116,39 @@ poly_traj::Trajectory predict_traj(const double acc, const double dir, const Eig
   return predicted_traj.getTraj();
 }
 
-void Traj2ROSMsg(const poly_traj::Trajectory &traj, const double des_clear, const int obstacle_id, traj_utils::MINCOTraj &MINCO_msg)
+void Traj2ROSMsg(const poly_traj::Trajectory &traj,
+                 const double des_clear,
+                 const int obstacle_id,
+                 traj_utils::PolyTraj &poly_msg)
 {
-
   Eigen::VectorXd durs = traj.getDurations();
   int piece_num = traj.getPieceNum();
-  double duration = durs.sum();
 
-  MINCO_msg.drone_id = obstacle_id;
-  MINCO_msg.traj_id = 0;
-  MINCO_msg.start_time = ros::Time::now();
-  MINCO_msg.order = 5; // todo, only support order = 5 now.
-  MINCO_msg.duration.resize(piece_num);
-  MINCO_msg.des_clearance = des_clear;
-  Eigen::Vector3d vec;
-  vec = traj.getPos(0);
-  MINCO_msg.start_p[0] = vec(0), MINCO_msg.start_p[1] = vec(1), MINCO_msg.start_p[2] = vec(2);
-  vec = traj.getVel(0);
-  MINCO_msg.start_v[0] = vec(0), MINCO_msg.start_v[1] = vec(1), MINCO_msg.start_v[2] = vec(2);
-  vec = traj.getAcc(0);
-  MINCO_msg.start_a[0] = vec(0), MINCO_msg.start_a[1] = vec(1), MINCO_msg.start_a[2] = vec(2);
-  vec = traj.getPos(duration);
-  MINCO_msg.end_p[0] = vec(0), MINCO_msg.end_p[1] = vec(1), MINCO_msg.end_p[2] = vec(2);
-  vec = traj.getVel(duration);
-  MINCO_msg.end_v[0] = vec(0), MINCO_msg.end_v[1] = vec(1), MINCO_msg.end_v[2] = vec(2);
-  vec = traj.getAcc(duration);
-  MINCO_msg.end_a[0] = vec(0), MINCO_msg.end_a[1] = vec(1), MINCO_msg.end_a[2] = vec(2);
-  MINCO_msg.inner_x.resize(piece_num - 1);
-  MINCO_msg.inner_y.resize(piece_num - 1);
-  MINCO_msg.inner_z.resize(piece_num - 1);
-  Eigen::MatrixXd pos = traj.getPositions();
-  for (int i = 0; i < piece_num - 1; i++)
-  {
-    MINCO_msg.inner_x[i] = pos(0, i + 1);
-    MINCO_msg.inner_y[i] = pos(1, i + 1);
-    MINCO_msg.inner_z[i] = pos(2, i + 1);
-  }
+  poly_msg.drone_id = obstacle_id;
+  poly_msg.traj_id = 0;
+  poly_msg.start_time = ros::Time::now();
+  poly_msg.order = 5;
+  poly_msg.des_clearance = des_clear;
+  poly_msg.duration.resize(piece_num);
+  poly_msg.coef_x.resize(6 * piece_num);
+  poly_msg.coef_y.resize(6 * piece_num);
+  poly_msg.coef_z.resize(6 * piece_num);
+
   for (int i = 0; i < piece_num; i++)
-    MINCO_msg.duration[i] = durs[i];
+  {
+    poly_msg.duration[i] = durs[i];
+
+    const auto &seg_coeffs = traj[i].getCoeffMat();
+    const int base = i * 6;
+    for (int j = 0; j < 6; ++j)
+    {
+      // poly_traj stores coeffs as [t^5 ... t^0], while PolyTraj expects [t^0 ... t^5].
+      const int src_col = 5 - j;
+      poly_msg.coef_x[base + j] = seg_coeffs(0, src_col);
+      poly_msg.coef_y[base + j] = seg_coeffs(1, src_col);
+      poly_msg.coef_z[base + j] = seg_coeffs(2, src_col);
+    }
+  }
 }
 
 // #      ^                ^
@@ -210,18 +205,18 @@ void joy_sub_cb(const sensor_msgs::Joy::ConstPtr &msg)
   ros::Duration(0.005).sleep();
 
   // publish predicted trajectory
-  traj_utils::MINCOTraj MINCO_msg;
+  traj_utils::PolyTraj poly_msg;
   vector<Eigen::Vector3d> vis_pts;
   poly_traj::Trajectory traj1 = predict_traj(acc1, dir1, Eigen::Vector3d(pv1.first[0], pv1.first[1], HEIGHT), Eigen::Vector3d(pv1.second[0], pv1.second[1], 0), obs1_, vis_pts);
-  Traj2ROSMsg(traj1, obs1_.des_clearance_, obs1_id_, MINCO_msg);
-  predicted_traj_pub_.publish(MINCO_msg);
+  Traj2ROSMsg(traj1, obs1_.des_clearance_, obs1_id_, poly_msg);
+  predicted_traj_pub_.publish(poly_msg);
   ros::Duration(0.005).sleep();
   visualization_->displayInitPathList(vis_pts, 0.1, obs1_id_);
   ros::Duration(0.005).sleep();
 
   poly_traj::Trajectory traj2 = predict_traj(acc2, dir2, Eigen::Vector3d(pv2.first[0], pv2.first[1], HEIGHT), Eigen::Vector3d(pv2.second[0], pv2.second[1], 0), obs2_, vis_pts);
-  Traj2ROSMsg(traj2, obs2_.des_clearance_, obs2_id_, MINCO_msg);
-  predicted_traj_pub_.publish(MINCO_msg);
+  Traj2ROSMsg(traj2, obs2_.des_clearance_, obs2_id_, poly_msg);
+  predicted_traj_pub_.publish(poly_msg);
   ros::Duration(0.005).sleep();
   visualization_->displayInitPathList(vis_pts, 0.1, obs2_id_);
 }
@@ -233,7 +228,7 @@ int main(int argc, char **argv)
 
   obs1_odom_pub_ = nh.advertise<nav_msgs::Odometry>("odom_obs1", 10);
   obs2_odom_pub_ = nh.advertise<nav_msgs::Odometry>("odom_obs2", 10);
-  predicted_traj_pub_ = nh.advertise<traj_utils::MINCOTraj>("/broadcast_traj_to_planner", 10);
+  predicted_traj_pub_ = nh.advertise<traj_utils::PolyTraj>("/broadcast_traj_to_planner", 10);
   ros::Subscriber joy_sub = nh.subscribe<sensor_msgs::Joy>("joy", 10, joy_sub_cb);
 
   visualization_.reset(new ego_planner::PlanningVisualization(nh));
