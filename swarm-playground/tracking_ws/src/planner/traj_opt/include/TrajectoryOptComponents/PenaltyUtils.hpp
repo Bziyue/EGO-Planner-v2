@@ -27,4 +27,19 @@ inline bool smoothedL1(const double &x,
     df = sqrxdmu * ((-0.5) * xdmu + 3.0 * mumxd2 / mu);
     return true;
 }
+
+inline bool positivePartCubic(const double &x,
+                              double &f,
+                              double &df)
+{
+    if (x <= 0.0)
+    {
+        return false;
+    }
+
+    const double sqr_x = x * x;
+    f = sqr_x * x;
+    df = 3.0 * sqr_x;
+    return true;
+}
 }
