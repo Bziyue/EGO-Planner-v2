@@ -57,7 +57,7 @@ public:
 
     int getUnconstrainedDim(int index) const
     {
-        if (identity_mode || !v_polys || !v_poly_idx || index <= 0 || index >= num_segments)
+        if (identity_mode || !v_polys || !v_poly_idx || index <= 0 || index > num_segments)
         {
             return 3;
         }
@@ -66,7 +66,7 @@ public:
 
     VectorType toPhysical(const Eigen::VectorXd &xi, int index) const
     {
-        if (identity_mode || !v_polys || !v_poly_idx || index <= 0 || index >= num_segments)
+        if (identity_mode || !v_polys || !v_poly_idx || index <= 0 || index > num_segments)
         {
             return xi.head<3>();
         }
@@ -87,7 +87,7 @@ public:
 
     Eigen::VectorXd toUnconstrained(const Eigen::VectorXd &p, int index) const
     {
-        if (identity_mode || !v_polys || !v_poly_idx || index <= 0 || index >= num_segments)
+        if (identity_mode || !v_polys || !v_poly_idx || index <= 0 || index > num_segments)
         {
             return p;
         }
@@ -106,7 +106,7 @@ public:
                                  const Eigen::VectorXd &grad_p,
                                  int index) const
     {
-        if (identity_mode || !v_polys || !v_poly_idx || index <= 0 || index >= num_segments)
+        if (identity_mode || !v_polys || !v_poly_idx || index <= 0 || index > num_segments)
         {
             return grad_p;
         }
@@ -148,6 +148,7 @@ private:
     {
         const long size_p = v_idx.size();
         grad_xi.resize(xi.size());
+        grad_xi.setZero();
 
         double sqr_norm_q, sqr_norm_violation, c, dc;
         Eigen::VectorXd q;
