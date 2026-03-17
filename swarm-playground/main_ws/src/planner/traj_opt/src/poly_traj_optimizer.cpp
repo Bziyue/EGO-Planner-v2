@@ -74,7 +74,7 @@ namespace ego_planner
     min_ellip_dist2_.resize(swarm_trajs_->size());
 
     // Setup cost functions
-    time_cost_func_.wei_time = wei_time_;
+    time_cost_func_.weight = wei_time_;
 
     integral_cost_func_.grid_map = grid_map_;
     integral_cost_func_.cps = &cps_;
