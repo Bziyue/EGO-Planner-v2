@@ -1,24 +1,11 @@
 #pragma once
 
+#include "TrajectoryOptAdapters/PolytopeProjectionSolverAdapter.hpp"
 #include "TrajectoryOptComponents/SFCCommonTypes.hpp"
 
-#include <cfloat>
 #include <cmath>
 
 #include <Eigen/Eigen>
-
-#if __has_include("gcopter/lbfgs.hpp")
-#include "gcopter/lbfgs.hpp"
-#define TRAJ_OPT_COMPONENTS_LBFGS_NS lbfgs
-#elif __has_include("utils/optimization/lbfgs.h")
-#include "utils/optimization/lbfgs.h"
-#define TRAJ_OPT_COMPONENTS_LBFGS_NS math_utils::lbfgs
-#elif __has_include("optimizer/lbfgs.hpp")
-#include "optimizer/lbfgs.hpp"
-#define TRAJ_OPT_COMPONENTS_LBFGS_NS lbfgs
-#else
-#error "TrajectoryOptComponents/PolytopeSpatialMap.hpp requires an lbfgs header."
-#endif
 
 namespace traj_opt_components
 {
@@ -241,12 +228,6 @@ private:
         xi.resize(xi_dim);
 
         double min_sqr_d;
-        TRAJ_OPT_COMPONENTS_LBFGS_NS::lbfgs_parameter_t tiny_nls_params;
-        tiny_nls_params.past = 0;
-        tiny_nls_params.delta = 1.0e-5;
-        tiny_nls_params.g_epsilon = FLT_EPSILON;
-        tiny_nls_params.max_iterations = 128;
-
         Eigen::Matrix3Xd ov_poly;
         for (long i = 0, j = 0, k, l; i < size_p; ++i, j += k)
         {
@@ -258,18 +239,13 @@ private:
             ov_poly.rightCols(k) = v_polys[l];
             Eigen::VectorXd x(k);
             x.setConstant(std::sqrt(1.0 / static_cast<double>(k)));
-            TRAJ_OPT_COMPONENTS_LBFGS_NS::lbfgs_optimize(x,
-                                                         min_sqr_d,
-                                                         &PolytopeSpatialMap::costTinyNLS,
-                                                         nullptr,
-                                                         nullptr,
-                                                         &ov_poly,
-                                                         tiny_nls_params);
+            traj_opt_adapters::PolytopeProjectionSolverAdapter::optimize(x,
+                                                                         min_sqr_d,
+                                                                         &PolytopeSpatialMap::costTinyNLS,
+                                                                         &ov_poly);
 
             xi.segment(j, k) = x;
         }
     }
 };
 }
-
-#undef TRAJ_OPT_COMPONENTS_LBFGS_NS

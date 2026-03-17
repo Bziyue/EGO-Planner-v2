@@ -1,21 +1,23 @@
 #pragma once
 
 #include "TrajectoryOptComponents/PenaltyUtils.hpp"
-#include "optimizer/traj_types.h"
+#include "TrajectoryOptAdapters/EgoPlanningTypesAdapter.hpp"
 
 namespace traj_opt_components
 {
+using EgoTypes = traj_opt_adapters::EgoPlanningTypesAdapter;
+
 inline double accumulateEgoSwarmPenalty(const int cp_idx,
-                                        ego_planner::ConstraintPoints *cps,
+                                        EgoTypes::ConstraintPoints *cps,
                                         const bool touch_goal,
-                                        const ego_planner::SwarmTrajData *swarm_trajs,
+                                        const EgoTypes::SwarmTrajData *swarm_trajs,
                                         const int drone_id,
                                         const double t_now,
                                         const double t_global,
                                         const double swarm_clearance,
                                         const double weight_swarm,
-                                        const ego_planner::Vec3 &position,
-                                        ego_planner::Vec3 &grad_position,
+                                        const EgoTypes::Vec3 &position,
+                                        EgoTypes::Vec3 &grad_position,
                                         double &grad_time,
                                         std::vector<double> *min_ellip_dist2_ptr = nullptr)
 {
@@ -25,7 +27,7 @@ inline double accumulateEgoSwarmPenalty(const int cp_idx,
     }
 
     if (!swarm_trajs || !cps || cp_idx <= 0 || cp_idx >= cps->cp_size ||
-        cp_idx > ego_planner::ConstraintPoints::two_thirds_id(cps->points, touch_goal))
+        cp_idx > EgoTypes::ConstraintPoints::two_thirds_id(cps->points, touch_goal))
     {
         return 0.0;
     }
@@ -48,8 +50,8 @@ inline double accumulateEgoSwarmPenalty(const int cp_idx,
         const double clearance = (swarm_clearance + (*swarm_trajs)[id].des_clearance) * 1.5;
         const double clearance2 = clearance * clearance;
 
-        ego_planner::Vec3 swarm_p;
-        ego_planner::Vec3 swarm_v;
+        EgoTypes::Vec3 swarm_p;
+        EgoTypes::Vec3 swarm_v;
         if (point_time < (*swarm_trajs)[id].duration)
         {
             swarm_p = (*swarm_trajs)[id].traj.evaluate((*swarm_trajs)[id].traj.getStartTime() + point_time,
@@ -65,7 +67,7 @@ inline double accumulateEgoSwarmPenalty(const int cp_idx,
                       (point_time - (*swarm_trajs)[id].duration) * swarm_v;
         }
 
-        const ego_planner::Vec3 dist_vec = position - swarm_p;
+        const EgoTypes::Vec3 dist_vec = position - swarm_p;
         const double ellip_dist2 = dist_vec(2) * dist_vec(2) * inv_a2 +
                                    (dist_vec(0) * dist_vec(0) + dist_vec(1) * dist_vec(1)) * inv_b2;
         const double dist2_err = clearance2 - ellip_dist2;
@@ -75,10 +77,10 @@ inline double accumulateEgoSwarmPenalty(const int cp_idx,
         if (positivePartCubic(dist2_err, penalty, penalty_grad))
         {
             cost += weight_swarm * penalty;
-            const ego_planner::Vec3 d_dist2_d_pos(inv_b2 * dist_vec(0),
-                                                  inv_b2 * dist_vec(1),
-                                                  inv_a2 * dist_vec(2));
-            const ego_planner::Vec3 d_cost_d_pos = weight_swarm * penalty_grad * (-2.0) * d_dist2_d_pos;
+            const EgoTypes::Vec3 d_dist2_d_pos(inv_b2 * dist_vec(0),
+                                               inv_b2 * dist_vec(1),
+                                               inv_a2 * dist_vec(2));
+            const EgoTypes::Vec3 d_cost_d_pos = weight_swarm * penalty_grad * (-2.0) * d_dist2_d_pos;
             grad_position += d_cost_d_pos;
             grad_time += d_cost_d_pos.dot(-swarm_v);
         }

@@ -1,16 +1,18 @@
 #pragma once
 
-#include "optimizer/traj_types.h"
+#include "TrajectoryOptAdapters/EgoPlanningTypesAdapter.hpp"
 
 #include <cmath>
 
 namespace traj_opt_components
 {
+using EgoTypes = traj_opt_adapters::EgoPlanningTypesAdapter;
+
 inline double accumulateEgoObstacleSoftPenalty(const double distance,
                                                const double clearance,
                                                const double weight,
-                                               const ego_planner::Vec3 &direction,
-                                               ego_planner::Vec3 &grad_position)
+                                               const EgoTypes::Vec3 &direction,
+                                               EgoTypes::Vec3 &grad_position)
 {
     if (weight <= 0.0)
     {

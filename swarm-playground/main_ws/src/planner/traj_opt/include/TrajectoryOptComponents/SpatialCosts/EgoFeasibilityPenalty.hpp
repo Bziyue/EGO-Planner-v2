@@ -1,22 +1,24 @@
 #pragma once
 
+#include "TrajectoryOptAdapters/EgoPlanningTypesAdapter.hpp"
 #include "TrajectoryOptComponents/SpatialCosts/EgoAccelerationFeasibilityPenalty.hpp"
 #include "TrajectoryOptComponents/SpatialCosts/EgoJerkFeasibilityPenalty.hpp"
 #include "TrajectoryOptComponents/SpatialCosts/EgoVelocityFeasibilityPenalty.hpp"
-#include "optimizer/traj_types.h"
 
 namespace traj_opt_components
 {
-inline double accumulateEgoFeasibilityPenalty(const ego_planner::Vec3 &velocity,
-                                              const ego_planner::Vec3 &acceleration,
-                                              const ego_planner::Vec3 &jerk,
+using EgoTypes = traj_opt_adapters::EgoPlanningTypesAdapter;
+
+inline double accumulateEgoFeasibilityPenalty(const EgoTypes::Vec3 &velocity,
+                                              const EgoTypes::Vec3 &acceleration,
+                                              const EgoTypes::Vec3 &jerk,
                                               const double max_vel,
                                               const double max_acc,
                                               const double max_jer,
                                               const double weight,
-                                              ego_planner::Vec3 &grad_velocity,
-                                              ego_planner::Vec3 &grad_acceleration,
-                                              ego_planner::Vec3 &grad_jerk)
+                                              EgoTypes::Vec3 &grad_velocity,
+                                              EgoTypes::Vec3 &grad_acceleration,
+                                              EgoTypes::Vec3 &grad_jerk)
 {
     if (weight <= 0.0)
     {

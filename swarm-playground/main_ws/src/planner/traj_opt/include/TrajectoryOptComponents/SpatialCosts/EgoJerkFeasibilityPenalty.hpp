@@ -1,14 +1,16 @@
 #pragma once
 
 #include "TrajectoryOptComponents/PenaltyUtils.hpp"
-#include "optimizer/traj_types.h"
+#include "TrajectoryOptAdapters/EgoPlanningTypesAdapter.hpp"
 
 namespace traj_opt_components
 {
-inline double accumulateEgoJerkFeasibilityPenalty(const ego_planner::Vec3 &jerk,
+using EgoTypes = traj_opt_adapters::EgoPlanningTypesAdapter;
+
+inline double accumulateEgoJerkFeasibilityPenalty(const EgoTypes::Vec3 &jerk,
                                                   const double max_jerk,
                                                   const double weight,
-                                                  ego_planner::Vec3 &grad_jerk)
+                                                  EgoTypes::Vec3 &grad_jerk)
 {
     if (weight <= 0.0)
     {
