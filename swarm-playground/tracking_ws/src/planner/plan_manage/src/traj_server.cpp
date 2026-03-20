@@ -1,12 +1,13 @@
 #include <nav_msgs/Odometry.h>
 #include <traj_utils/PolyTraj.h>
-#include <optimizer/poly_traj_utils.hpp>
+#include <SplineTrajectory/SplineTrajectory.hpp>
 #include <quadrotor_msgs/PositionCommand.h>
 #include <std_msgs/Empty.h>
 #include <visualization_msgs/Marker.h>
 #include <ros/ros.h>
 
 using namespace Eigen;
+using PPoly3D = SplineTrajectory::PPolyND<3, 6>;
 
 ros::Publisher pos_cmd_pub;
 
@@ -14,8 +15,11 @@ quadrotor_msgs::PositionCommand cmd;
 // double pos_gain[3] = {0, 0, 0};
 // double vel_gain[3] = {0, 0, 0};
 
+#define FLIP_YAW_AT_END 0
+#define TURN_YAW_TO_CENTER_AT_END 0
+
 bool receive_traj_ = false;
-boost::shared_ptr<poly_traj::Trajectory> traj_;
+boost::shared_ptr<PPoly3D> traj_;
 double traj_duration_;
 ros::Time start_time_;
 int traj_id_;
@@ -45,25 +49,33 @@ void polyTrajCallback(traj_utils::PolyTrajPtr msg)
   }
 
   int piece_nums = msg->duration.size();
-  std::vector<double> dura(piece_nums);
-  std::vector<poly_traj::CoefficientMat> cMats(piece_nums);
+  const int num_coeffs = 6; // order + 1
+
+  // Build breakpoints: [0, dur0, dur0+dur1, ...]
+  std::vector<double> breakpoints(piece_nums + 1);
+  breakpoints[0] = 0.0;
+  for (int i = 0; i < piece_nums; ++i)
+    breakpoints[i + 1] = breakpoints[i] + msg->duration[i];
+
+  // Build coefficient matrix: (piece_nums * num_coeffs) x 3, RowMajor
+  // Row (i * num_coeffs + k) = coefficient for segment i, power k
+  using MatrixType = Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor>;
+  MatrixType coefficients(piece_nums * num_coeffs, 3);
   for (int i = 0; i < piece_nums; ++i)
   {
     int i6 = i * 6;
-    cMats[i].row(0) << msg->coef_x[i6 + 0], msg->coef_x[i6 + 1], msg->coef_x[i6 + 2],
-        msg->coef_x[i6 + 3], msg->coef_x[i6 + 4], msg->coef_x[i6 + 5];
-    cMats[i].row(1) << msg->coef_y[i6 + 0], msg->coef_y[i6 + 1], msg->coef_y[i6 + 2],
-        msg->coef_y[i6 + 3], msg->coef_y[i6 + 4], msg->coef_y[i6 + 5];
-    cMats[i].row(2) << msg->coef_z[i6 + 0], msg->coef_z[i6 + 1], msg->coef_z[i6 + 2],
-        msg->coef_z[i6 + 3], msg->coef_z[i6 + 4], msg->coef_z[i6 + 5];
-
-    dura[i] = msg->duration[i];
+    for (int j = 0; j < 6; j++)
+    {
+      coefficients(i * num_coeffs + j, 0) = msg->coef_x[i6 + j];
+      coefficients(i * num_coeffs + j, 1) = msg->coef_y[i6 + j];
+      coefficients(i * num_coeffs + j, 2) = msg->coef_z[i6 + j];
+    }
   }
 
-  traj_.reset(new poly_traj::Trajectory(dura, cMats));
+  traj_.reset(new PPoly3D(breakpoints, coefficients, num_coeffs));
 
   start_time_ = msg->start_time;
-  traj_duration_ = traj_->getTotalDuration();
+  traj_duration_ = traj_->getDuration();
   traj_id_ = msg->traj_id;
 
   receive_traj_ = true;
@@ -76,8 +88,8 @@ std::pair<double, double> calculate_yaw(double t_cur, Eigen::Vector3d &pos, doub
   std::pair<double, double> yaw_yawdot(0, 0);
 
   Eigen::Vector3d dir = t_cur + time_forward_ <= traj_duration_
-                            ? traj_->getPos(t_cur + time_forward_) - pos
-                            : traj_->getPos(traj_duration_) - pos;
+                            ? traj_->evaluate(t_cur + time_forward_, SplineTrajectory::Deriv::Pos) - pos
+                            : traj_->evaluate(traj_duration_, SplineTrajectory::Deriv::Pos) - pos;
   double yaw_temp = dir.norm() > 0.1
                         ? atan2(dir(1), dir(0))
                         : last_yaw_;
@@ -147,8 +159,7 @@ void publish_cmd(Vector3d p, Vector3d v, Vector3d a, Vector3d j, double y, doubl
   cmd.acceleration.x = a(0);
   cmd.acceleration.y = a(1);
   cmd.acceleration.z = a(2);
-  // cmd.yaw = y;
-  cmd.yaw = 0.0;
+  cmd.yaw = y;
   cmd.yaw_dot = yd;
   pos_cmd_pub.publish(cmd);
 
@@ -170,7 +181,7 @@ void cmdCallback(const ros::TimerEvent &e)
 
   if ((time_now - heartbeat_time_).toSec() > 0.5)
   {
-    ROS_ERROR("[traj_server] Lost heartbeat from the planner, is he dead?");
+    ROS_ERROR("[traj_server] Lost heartbeat from the planner, is it dead?");
 
     receive_traj_ = false;
     publish_cmd(last_pos_, Vector3d::Zero(), Vector3d::Zero(), Vector3d::Zero(), last_yaw_, 0);
@@ -182,12 +193,15 @@ void cmdCallback(const ros::TimerEvent &e)
   std::pair<double, double> yaw_yawdot(0, 0);
 
   static ros::Time time_last = ros::Time::now();
+#if FLIP_YAW_AT_END or TURN_YAW_TO_CENTER_AT_END
+  static bool finished = false;
+#endif
   if (t_cur < traj_duration_ && t_cur >= 0.0)
   {
-    pos = traj_->getPos(t_cur);
-    vel = traj_->getVel(t_cur);
-    acc = traj_->getAcc(t_cur);
-    jer = traj_->getJer(t_cur);
+    pos = traj_->evaluate(t_cur, SplineTrajectory::Deriv::Pos);
+    vel = traj_->evaluate(t_cur, SplineTrajectory::Deriv::Vel);
+    acc = traj_->evaluate(t_cur, SplineTrajectory::Deriv::Acc);
+    jer = traj_->evaluate(t_cur, SplineTrajectory::Deriv::Jerk);
 
     /*** calculate yaw ***/
     yaw_yawdot = calculate_yaw(t_cur, pos, (time_now - time_last).toSec());
@@ -206,10 +220,98 @@ void cmdCallback(const ros::TimerEvent &e)
     slowly_turn_to_center_target_ = atan2(CENTER[1] - pos(1), CENTER[0] - pos(0));
 
     // publish
-    yaw_yawdot.first = 0.0;
-    yaw_yawdot.second = 0.0;
+    publish_cmd(pos, vel, acc, jer, yaw_yawdot.first, yaw_yawdot.second);
+#if FLIP_YAW_AT_END or TURN_YAW_TO_CENTER_AT_END
+    finished = false;
+#endif
+  }
+
+#if FLIP_YAW_AT_END
+  else if (t_cur >= traj_duration_)
+  {
+    if (finished)
+      return;
+
+    /* hover when finished traj_ */
+    pos = traj_->evaluate(traj_duration_, SplineTrajectory::Deriv::Pos);
+    vel.setZero();
+    acc.setZero();
+    jer.setZero();
+
+    if (slowly_flip_yaw_target_ > 0)
+    {
+      last_yaw_ += (time_now - time_last).toSec() * M_PI / 2;
+      yaw_yawdot.second = M_PI / 2;
+      if (last_yaw_ >= slowly_flip_yaw_target_)
+      {
+        finished = true;
+      }
+    }
+    else
+    {
+      last_yaw_ -= (time_now - time_last).toSec() * M_PI / 2;
+      yaw_yawdot.second = -M_PI / 2;
+      if (last_yaw_ <= slowly_flip_yaw_target_)
+      {
+        finished = true;
+      }
+    }
+
+    yaw_yawdot.first = last_yaw_;
+    time_last = time_now;
+
     publish_cmd(pos, vel, acc, jer, yaw_yawdot.first, yaw_yawdot.second);
   }
+#endif
+
+#if TURN_YAW_TO_CENTER_AT_END
+  else if (t_cur >= traj_duration_)
+  {
+    if (finished)
+      return;
+
+    /* hover when finished traj_ */
+    pos = traj_->evaluate(traj_duration_, SplineTrajectory::Deriv::Pos);
+    vel.setZero();
+    acc.setZero();
+    jer.setZero();
+
+    double d_yaw = last_yaw_ - slowly_turn_to_center_target_;
+    if (d_yaw >= M_PI)
+    {
+      last_yaw_ += (time_now - time_last).toSec() * M_PI / 2;
+      yaw_yawdot.second = M_PI / 2;
+      if (last_yaw_ > M_PI)
+        last_yaw_ -= 2 * M_PI;
+    }
+    else if (d_yaw <= -M_PI)
+    {
+      last_yaw_ -= (time_now - time_last).toSec() * M_PI / 2;
+      yaw_yawdot.second = -M_PI / 2;
+      if (last_yaw_ < -M_PI)
+        last_yaw_ += 2 * M_PI;
+    }
+    else if (d_yaw >= 0)
+    {
+      last_yaw_ -= (time_now - time_last).toSec() * M_PI / 2;
+      yaw_yawdot.second = -M_PI / 2;
+      if (last_yaw_ <= slowly_turn_to_center_target_)
+        finished = true;
+    }
+    else
+    {
+      last_yaw_ += (time_now - time_last).toSec() * M_PI / 2;
+      yaw_yawdot.second = M_PI / 2;
+      if (last_yaw_ >= slowly_turn_to_center_target_)
+        finished = true;
+    }
+
+    yaw_yawdot.first = last_yaw_;
+    time_last = time_now;
+
+    publish_cmd(pos, vel, acc, jer, yaw_yawdot.first, yaw_yawdot.second);
+  }
+#endif
 }
 
 int main(int argc, char **argv)

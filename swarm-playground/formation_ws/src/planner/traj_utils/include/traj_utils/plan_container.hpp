@@ -5,18 +5,20 @@
 #include <vector>
 #include <ros/ros.h>
 
-#include <optimizer/poly_traj_utils.hpp>
+#include <SplineTrajectory/SplineTrajectory.hpp>
 
 using std::vector;
 
 namespace ego_planner
 {
+  // Type alias for the 3D piecewise polynomial trajectory
+  using PPoly3D = SplineTrajectory::PPolyND<3, 6>;
 
   typedef std::vector<std::vector<std::pair<double, Eigen::Vector3d>>> PtsChk_t;
 
   struct GlobalTrajData
   {
-    poly_traj::Trajectory traj;
+    PPoly3D traj;
     double global_start_time; // world time
     double duration;
 
@@ -32,7 +34,7 @@ namespace ego_planner
 
   struct LocalTrajData
   {
-    poly_traj::Trajectory traj;
+    PPoly3D traj;
     PtsChk_t pts_chk;
     int drone_id; // A negative value indicates no received trajectories.
     int traj_id;
@@ -40,7 +42,7 @@ namespace ego_planner
     double start_time; // world time
     double end_time;   // world time
     Eigen::Vector3d start_pos;
-
+    double des_clearance;
   };
 
   typedef std::vector<LocalTrajData> SwarmTrajData;
@@ -58,10 +60,10 @@ namespace ego_planner
     }
     ~TrajContainer() {}
 
-    void setGlobalTraj(const poly_traj::Trajectory &trajectory, const double &world_time)
+    void setGlobalTraj(const PPoly3D &trajectory, const double &world_time)
     {
       global_traj.traj = trajectory;
-      global_traj.duration = trajectory.getTotalDuration();
+      global_traj.duration = trajectory.getDuration();
       global_traj.global_start_time = world_time;
       global_traj.glb_t_of_lc_tgt = world_time;
       global_traj.last_glb_t_of_lc_tgt = -1.0;
@@ -71,17 +73,16 @@ namespace ego_planner
       local_traj.traj_id = 0;
     }
 
-    void setLocalTraj(const poly_traj::Trajectory &trajectory, const PtsChk_t &pts_to_chk, const double &world_time, const int drone_id = -1)
+    void setLocalTraj(const PPoly3D &trajectory, const PtsChk_t &pts_to_chk, const double &world_time, const int drone_id = -1)
     {
       local_traj.drone_id = drone_id;
       local_traj.traj_id++;
-      local_traj.duration = trajectory.getTotalDuration();
-      local_traj.start_pos = trajectory.getJuncPos(0);
+      local_traj.duration = trajectory.getDuration();
+      local_traj.start_pos = trajectory.evaluate(trajectory.getStartTime(), SplineTrajectory::Deriv::Pos);
       local_traj.start_time = world_time;
       local_traj.traj = trajectory;
       local_traj.pts_chk = pts_to_chk;
     }
-
   };
 
   struct PlanParameters
@@ -91,7 +92,7 @@ namespace ego_planner
     double polyTraj_piece_length;  // distance between adjacient B-spline control points
     double feasibility_tolerance_; // permitted ratio of vel/acc exceeding limits
     double planning_horizen_;
-    bool use_distinctive_trajs;
+    bool use_multitopology_trajs;
     bool touch_goal;
     int drone_id; // single drone: drone_id <= -1, swarm: drone_id >= 0
 

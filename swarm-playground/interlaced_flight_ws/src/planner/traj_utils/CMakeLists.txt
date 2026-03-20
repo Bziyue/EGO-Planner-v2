@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 2.8.3)
 project(traj_utils)
 
 set(CMAKE_BUILD_TYPE "Release")
-set(CMAKE_CXX_FLAGS "-std=c++11")
+set(CMAKE_CXX_FLAGS "-std=c++17")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -Wall -g")
 # set(ENABLE_PRECOMPILED_HEADERS "OFF")
 
@@ -21,7 +21,6 @@ add_message_files(
   FILES
   DataDisp.msg
   PolyTraj.msg
-  MINCOTraj.msg
   )
   
 # Generate added messages and services with any dependencies listed here

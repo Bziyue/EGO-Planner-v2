@@ -1,6 +1,7 @@
 int16 drone_id
 int32 traj_id
 time start_time
+float32 des_clearance
 
 uint8 order
 float32[] coef_x

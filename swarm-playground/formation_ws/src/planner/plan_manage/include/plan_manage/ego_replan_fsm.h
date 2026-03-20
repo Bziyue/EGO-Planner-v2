@@ -20,7 +20,6 @@
 #include <plan_manage/planner_manager.h>
 #include <traj_utils/planning_visualization.h>
 #include <traj_utils/PolyTraj.h>
-#include <traj_utils/MINCOTraj.h>
 
 using std::vector;
 
@@ -65,13 +64,12 @@ namespace ego_planner
     int target_type_; // 1 mannual select, 2 hard code
     double no_replan_thresh_, replan_thresh_;
     double waypoints_[50][3];
-    int form_num_;
-    Eigen::MatrixXd formation_;
-    int waypoint_num_, wpt_id_;
+    int form_num_, waypoint_num_, wpt_id_;
     double planning_horizen_;
     double emergency_time_;
     bool flag_realworld_experiment_;
     bool enable_fail_safe_;
+    bool enable_ground_height_measurement_;
     bool flag_escape_emergency_;
 
     bool have_trigger_, have_target_, have_odom_, have_new_target_, have_recv_pre_agent_, touch_goal_, mandatory_stop_;
@@ -79,13 +77,12 @@ namespace ego_planner
     int continously_called_times_{0};
 
     Eigen::Vector3d start_pt_, start_vel_, start_acc_;   // start state
-    Eigen::Vector3d end_pt_;                             // goal state
+    Eigen::Vector3d final_goal_;                        // goal state
     Eigen::Vector3d local_target_pt_, local_target_vel_; // local target state
     Eigen::Vector3d odom_pos_, odom_vel_, odom_acc_;     // odometry state
     std::vector<Eigen::Vector3d> wps_;
-
+    Eigen::MatrixXd formation_;
     Eigen::Vector3d formation_start_;
-    // int formation_num_;
     Eigen::Vector3d formation_pos_;
 
     /* ROS utils */
@@ -111,16 +108,16 @@ namespace ego_planner
 
     /* global trajectory */
     void waypointCallback(const geometry_msgs::PoseStampedPtr &msg);
-    // void planGlobalTrajbyGivenWps();
     void readGivenWpsAndPlan();
-    void planNextWaypoint(const Eigen::Vector3d next_wp, const Eigen::Vector3d previous_wp);
+    bool planNextWaypoint(const Eigen::Vector3d next_wp, const Eigen::Vector3d previous_wp);
+    bool mondifyInCollisionFinalGoal();
 
     /* input-output */
     void mandatoryStopCallback(const std_msgs::Empty &msg);
     void odometryCallback(const nav_msgs::OdometryConstPtr &msg);
     void triggerCallback(const geometry_msgs::PoseStampedPtr &msg);
-    void RecvBroadcastMINCOTrajCallback(const traj_utils::MINCOTrajConstPtr &msg);
-    void polyTraj2ROSMsg(traj_utils::PolyTraj &poly_msg, traj_utils::MINCOTraj &MINCO_msg);
+    void RecvBroadcastPolyTrajCallback(const traj_utils::PolyTrajConstPtr &msg);
+    void polyTraj2ROSMsg(traj_utils::PolyTraj &poly_msg);
 
     /* ground height measurement */
     bool measureGroundHeight(double &height);

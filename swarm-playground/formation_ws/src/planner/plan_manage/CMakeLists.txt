@@ -2,8 +2,8 @@ cmake_minimum_required(VERSION 2.8.3)
 project(ego_planner)
 
 set(CMAKE_BUILD_TYPE "Release")
-ADD_COMPILE_OPTIONS(-std=c++11 )
-ADD_COMPILE_OPTIONS(-std=c++14 )
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -Wall -g")
 
 find_package(Eigen3 REQUIRED)
@@ -52,5 +52,4 @@ target_link_libraries(ego_planner_node
 add_executable(traj_server src/traj_server.cpp)
 target_link_libraries(traj_server ${catkin_LIBRARIES})
 # add_dependencies(traj_server ${${PROJECT_NAME}_EXPORTED_TARGETS})
-
 

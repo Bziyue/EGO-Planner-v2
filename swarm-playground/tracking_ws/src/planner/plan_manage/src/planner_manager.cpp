@@ -1,27 +1,21 @@
-// #include <fstream>
 #include <plan_manage/planner_manager.h>
 #include <thread>
-#include "visualization_msgs/Marker.h" // zx-todo
+#include "visualization_msgs/Marker.h"
 
 namespace ego_planner
 {
 
-  // SECTION interfaces for setup and query
-
   EGOPlannerManager::EGOPlannerManager() {}
-
   EGOPlannerManager::~EGOPlannerManager() { std::cout << "des manager" << std::endl; }
 
   void EGOPlannerManager::initPlanModules(ros::NodeHandle &nh, PlanningVisualization::Ptr vis)
   {
-    /* read algorithm parameters */
-
     nh.param("manager/max_vel", pp_.max_vel_, -1.0);
     nh.param("manager/max_acc", pp_.max_acc_, -1.0);
     nh.param("manager/feasibility_tolerance", pp_.feasibility_tolerance_, 0.0);
     nh.param("manager/polyTraj_piece_length", pp_.polyTraj_piece_length, -1.0);
     nh.param("manager/planning_horizon", pp_.planning_horizen_, 5.0);
-    nh.param("manager/use_distinctive_trajs", pp_.use_distinctive_trajs, false);
+    nh.param("manager/use_multitopology_trajs", pp_.use_multitopology_trajs, false);
     nh.param("manager/drone_id", pp_.drone_id, -1);
 
     grid_map_.reset(new GridMap);
@@ -37,21 +31,241 @@ namespace ego_planner
     ploy_traj_opt_->setDroneId(pp_.drone_id);
   }
 
+  // Helper: generate trajectory from headState, tailState, innerPts, durations
+  static PPoly3D generateSplineTraj(
+      const Eigen::Matrix<double, 3, 3> &headState,
+      const Eigen::Matrix<double, 3, 3> &tailState,
+      const Eigen::MatrixXd &innerPts,
+      const Eigen::VectorXd &durations)
+  {
+    int piece_num = durations.size();
+    WaypointsMat waypoints(innerPts.cols() + 2, 3);
+    waypoints.row(0) = headState.col(0).transpose();
+    for (int i = 0; i < innerPts.cols(); ++i)
+      waypoints.row(i + 1) = innerPts.col(i).transpose();
+    waypoints.row(innerPts.cols() + 1) = tailState.col(0).transpose();
+
+    BCs bc;
+    bc.start_velocity = headState.col(1);
+    bc.start_acceleration = headState.col(2);
+    bc.end_velocity = tailState.col(1);
+    bc.end_acceleration = tailState.col(2);
+
+    std::vector<double> time_segs(piece_num);
+    for (int i = 0; i < piece_num; ++i)
+      time_segs[i] = durations(i);
+
+    SplineTrajectory::QuinticSplineND<3> spline;
+    spline.update(time_segs, waypoints, 0.0, bc);
+    return spline.getTrajectoryCopy();
+  }
+
+  // Helper: get durations from PPoly3D
+  static Eigen::VectorXd getDurationsFromTraj(const PPoly3D &traj)
+  {
+    int num_segs = traj.getNumSegments();
+    Eigen::VectorXd durs(num_segs);
+    for (int i = 0; i < num_segs; ++i)
+      durs(i) = (*(traj.begin() + i)).duration();
+    return durs;
+  }
+
+  // Helper: get max velocity rate from PPoly3D
+  static double getMaxVelRate(const PPoly3D &traj)
+  {
+    double maxVel = 0.0;
+    double dt = 0.01;
+    for (double t = traj.getStartTime(); t <= traj.getEndTime(); t += dt)
+    {
+      double vel = traj.evaluate(t, SplineTrajectory::Deriv::Vel).norm();
+      if (vel > maxVel)
+        maxVel = vel;
+    }
+    return maxVel;
+  }
+
+
+  bool EGOPlannerManager::reboundReplan(
+      const Eigen::Vector3d &start_pt, const Eigen::Vector3d &start_vel,
+      const Eigen::Vector3d &start_acc, const Eigen::Vector3d &local_target_pt,
+      const Eigen::Vector3d &local_target_vel, const Eigen::Vector3d &object_pt,
+      const Eigen::Vector3d &object_vel, const Eigen::Quaterniond &object_q,
+      const Eigen::Vector3d &relative_track_pt, const bool flag_polyInit,
+      const bool flag_randomPolyTraj, const bool touch_goal, const bool satrt_tracking)
+  {
+    ros::Time t_start = ros::Time::now();
+    ros::Duration t_init, t_opt;
+
+    static int count = 0;
+    std::cout << "\033[47;30m\n[" << t_start << "] Drone " << pp_.drone_id << " Replan " << count++ << "\033[0m" << std::endl;
+
+    /*** STEP 1: INIT ***/
+    ploy_traj_opt_->setIfTouchGoal(touch_goal);
+    ploy_traj_opt_->setObject(object_pt, object_vel, object_q);
+    ploy_traj_opt_->setRelativeTrackingP(relative_track_pt);
+    ploy_traj_opt_->setStartTracking(satrt_tracking);
+    double ts = pp_.polyTraj_piece_length / pp_.max_vel_;
+
+    PPoly3D initTraj;
+    Eigen::MatrixXd innerPts;
+    Eigen::VectorXd durations;
+    Eigen::Matrix<double, 3, 3> headState, tailState;
+
+    if (!computeInitState(start_pt, start_vel, start_acc, local_target_pt, local_target_vel,
+                          flag_polyInit, flag_randomPolyTraj, ts,
+                          initTraj, innerPts, durations, headState, tailState))
+    {
+      return false;
+    }
+
+    Eigen::MatrixXd cstr_pts = ploy_traj_opt_->getInitConstraintPoints(initTraj, durations, ploy_traj_opt_->get_cps_num_prePiece_());
+    std::vector<std::pair<int, int>> segments;
+    if (ploy_traj_opt_->finelyCheckAndSetConstraintPoints(segments, initTraj, cstr_pts, true) == PolyTrajOptimizer::CHK_RET::ERR)
+    {
+      return false;
+    }
+
+    t_init = ros::Time::now() - t_start;
+
+    std::vector<Eigen::Vector3d> point_set;
+    for (int i = 0; i < cstr_pts.cols(); ++i)
+      point_set.push_back(cstr_pts.col(i));
+    visualization_->displayInitPathList(point_set, 0.2, 0);
+
+    t_start = ros::Time::now();
+
+    /*** STEP 2: OPTIMIZE ***/
+    bool flag_success = false;
+    std::vector<std::vector<Eigen::Vector3d>> vis_trajs;
+
+    if (pp_.use_multitopology_trajs)
+    {
+      std::vector<ConstraintPoints> trajs = ploy_traj_opt_->distinctiveTrajs(segments);
+      Eigen::VectorXi success = Eigen::VectorXi::Zero(trajs.size());
+      double final_cost, min_cost = 999999.0;
+      PPoly3D best_traj;
+      Eigen::VectorXd best_durations;
+
+      for (int i = trajs.size() - 1; i >= 0; i--)
+      {
+        ploy_traj_opt_->setConstraintPoints(trajs[i]);
+        ploy_traj_opt_->setUseMultitopologyTrajs(true);
+        if (ploy_traj_opt_->optimizeTrajectory(headState, tailState,
+                                               innerPts, durations, final_cost))
+        {
+          success[i] = true;
+
+          if (final_cost < min_cost)
+          {
+            min_cost = final_cost;
+            const SplineTraj *opt_spline = ploy_traj_opt_->getSplineOpt().getOptimalSpline();
+            if (opt_spline)
+            {
+              best_traj = opt_spline->getTrajectoryCopy();
+              best_durations = getDurationsFromTraj(best_traj);
+            }
+            flag_success = true;
+          }
+
+          // visualization
+          const SplineTraj *vis_spline = ploy_traj_opt_->getSplineOpt().getOptimalSpline();
+          if (vis_spline)
+          {
+            PPoly3D vis_traj = vis_spline->getTrajectoryCopy();
+            Eigen::VectorXd vis_durs = getDurationsFromTraj(vis_traj);
+            Eigen::MatrixXd ctrl_pts_temp = ploy_traj_opt_->getInitConstraintPoints(vis_traj, vis_durs, ploy_traj_opt_->get_cps_num_prePiece_());
+            std::vector<Eigen::Vector3d> vis_pts;
+            for (int j = 0; j < ctrl_pts_temp.cols(); j++)
+              vis_pts.push_back(ctrl_pts_temp.col(j));
+            vis_trajs.push_back(vis_pts);
+          }
+        }
+      }
+
+      t_opt = ros::Time::now() - t_start;
+
+      if (trajs.size() > 1)
+      {
+        std::cout << "\033[1;33m" << "multi-trajs=" << trajs.size() << ",\033[1;0m"
+                  << " Success:fail=" << success.sum() << ":" << success.size() - success.sum() << std::endl;
+      }
+
+      visualization_->displayMultiInitPathList(vis_trajs, 0.1);
+
+      if (flag_success)
+      {
+        setLocalTrajFromOpt(best_traj, best_durations, touch_goal);
+        cstr_pts = ploy_traj_opt_->getInitConstraintPoints(best_traj, best_durations, ploy_traj_opt_->get_cps_num_prePiece_());
+        visualization_->displayOptimalList(cstr_pts, 0);
+
+      }
+    }
+    else
+    {
+      double final_cost;
+      flag_success = ploy_traj_opt_->optimizeTrajectory(headState, tailState,
+                                                        innerPts, durations, final_cost);
+
+      t_opt = ros::Time::now() - t_start;
+
+      if (flag_success)
+      {
+        const SplineTraj *opt_spline = ploy_traj_opt_->getSplineOpt().getOptimalSpline();
+        if (opt_spline)
+        {
+          PPoly3D opt_traj = opt_spline->getTrajectoryCopy();
+          Eigen::VectorXd opt_durs = getDurationsFromTraj(opt_traj);
+          setLocalTrajFromOpt(opt_traj, opt_durs, touch_goal);
+          cstr_pts = ploy_traj_opt_->getInitConstraintPoints(opt_traj, opt_durs, ploy_traj_opt_->get_cps_num_prePiece_());
+          visualization_->displayOptimalList(cstr_pts, 0);
+
+        }
+      }
+    }
+
+    /*** STEP 3: Store and display results ***/
+    std::cout << "Success=" << (flag_success ? "yes" : "no") << std::endl;
+    if (flag_success)
+    {
+      static double sum_time = 0;
+      static int count_success = 0;
+      sum_time += (t_init + t_opt).toSec();
+      count_success++;
+      printf("Time:\033[42m%.3fms,\033[0m init:%.3fms, optimize:%.3fms, avg=%.3fms\n",
+             (t_init + t_opt).toSec() * 1000, t_init.toSec() * 1000, t_opt.toSec() * 1000, sum_time / count_success * 1000);
+
+      continous_failures_count_ = 0;
+    }
+    else
+    {
+      const SplineTraj *fail_spline = ploy_traj_opt_->getSplineOpt().getOptimalSpline();
+      if (fail_spline)
+      {
+        PPoly3D fail_traj = fail_spline->getTrajectoryCopy();
+        Eigen::VectorXd fail_durs = getDurationsFromTraj(fail_traj);
+        cstr_pts = ploy_traj_opt_->getInitConstraintPoints(fail_traj, fail_durs, ploy_traj_opt_->get_cps_num_prePiece_());
+        visualization_->displayFailedList(cstr_pts, 0);
+      }
+
+      continous_failures_count_++;
+    }
+
+    return flag_success;
+  }
+
   bool EGOPlannerManager::computeInitState(
       const Eigen::Vector3d &start_pt, const Eigen::Vector3d &start_vel, const Eigen::Vector3d &start_acc,
       const Eigen::Vector3d &local_target_pt, const Eigen::Vector3d &local_target_vel,
       const bool flag_polyInit, const bool flag_randomPolyTraj, const double &ts,
-      poly_traj::MinJerkOpt &initMJO)
+      PPoly3D &initTraj, Eigen::MatrixXd &outInnerPts, Eigen::VectorXd &outDurations,
+      Eigen::Matrix<double, 3, 3> &headState, Eigen::Matrix<double, 3, 3> &tailState)
   {
-
     static bool flag_first_call = true;
 
-    if (flag_first_call || flag_polyInit) /*** case 1: polynomial initialization ***/
+    if (flag_first_call || flag_polyInit)
     {
       flag_first_call = false;
 
-      /* basic params */
-      Eigen::Matrix3d headState, tailState;
       Eigen::MatrixXd innerPs;
       Eigen::VectorXd piece_dur_vec;
       int piece_nums;
@@ -59,14 +273,8 @@ namespace ego_planner
       headState << start_pt, start_vel, start_acc;
       tailState << local_target_pt, local_target_vel, Eigen::Vector3d::Zero();
 
-      /* determined or random inner point */
       if (!flag_randomPolyTraj)
       {
-        if (innerPs.cols() != 0)
-        {
-          ROS_ERROR("innerPs.cols() != 0");
-        }
-
         piece_nums = 1;
         piece_dur_vec.resize(1);
         piece_dur_vec(0) = init_of_init_totaldur;
@@ -89,13 +297,12 @@ namespace ego_planner
         piece_dur_vec = Eigen::Vector2d(init_of_init_totaldur / 2, init_of_init_totaldur / 2);
       }
 
-      /* generate the init of init trajectory */
-      initMJO.reset(headState, tailState, piece_nums);
-      initMJO.generate(innerPs, piece_dur_vec);
-      poly_traj::Trajectory initTraj = initMJO.getTraj();
+      // Generate init of init trajectory
+      PPoly3D initOfInitTraj = generateSplineTraj(headState, tailState, innerPs, piece_dur_vec);
 
-      /* generate the real init trajectory */
-      piece_nums = round((headState.col(0) - tailState.col(0)).norm() / pp_.polyTraj_piece_length);
+      // Generate the real init trajectory
+      double dist = (headState.col(0) - tailState.col(0)).norm();
+      piece_nums = round(dist / pp_.polyTraj_piece_length);
       if (piece_nums < 2)
         piece_nums = 2;
       double piece_dur = init_of_init_totaldur / (double)piece_nums;
@@ -104,19 +311,23 @@ namespace ego_planner
       innerPs.resize(3, piece_nums - 1);
       int id = 0;
       double t_s = piece_dur, t_e = init_of_init_totaldur - piece_dur / 2;
+      double start_time = initOfInitTraj.getStartTime();
       for (double t = t_s; t < t_e; t += piece_dur)
       {
-        innerPs.col(id++) = initTraj.getPos(t);
+        innerPs.col(id++) = initOfInitTraj.evaluate(start_time + t, SplineTrajectory::Deriv::Pos);
       }
       if (id != piece_nums - 1)
       {
         ROS_ERROR("Should not happen! x_x");
         return false;
       }
-      initMJO.reset(headState, tailState, piece_nums);
-      initMJO.generate(innerPs, piece_dur_vec);
+
+      initTraj = generateSplineTraj(headState, tailState, innerPs, piece_dur_vec);
+
+      outInnerPts = innerPs;
+      outDurations = piece_dur_vec;
     }
-    else /*** case 2: initialize from previous optimal trajectory ***/
+    else
     {
       if (traj_.global_traj.last_glb_t_of_lc_tgt < 0.0)
       {
@@ -124,37 +335,39 @@ namespace ego_planner
         return false;
       }
 
-      /* the trajectory time system is a little bit complicated... */
       double passed_t_on_lctraj = ros::Time::now().toSec() - traj_.local_traj.start_time;
       double t_to_lc_end = traj_.local_traj.duration - passed_t_on_lctraj;
-      if ( t_to_lc_end < 0 )
+      if (t_to_lc_end < 0)
       {
         ROS_INFO("t_to_lc_end < 0, exit and wait for another call.");
         return false;
       }
       double t_to_lc_tgt = t_to_lc_end +
                            (traj_.global_traj.glb_t_of_lc_tgt - traj_.global_traj.last_glb_t_of_lc_tgt);
-      int piece_nums = ceil((start_pt - local_target_pt).norm() / pp_.polyTraj_piece_length);
+      double dist = (start_pt - local_target_pt).norm();
+      int piece_nums = ceil(dist / pp_.polyTraj_piece_length);
       if (piece_nums < 2)
         piece_nums = 2;
 
-      Eigen::Matrix3d headState, tailState;
-      Eigen::MatrixXd innerPs(3, piece_nums - 1);
-      Eigen::VectorXd piece_dur_vec = Eigen::VectorXd::Constant(piece_nums, t_to_lc_tgt / piece_nums);
       headState << start_pt, start_vel, start_acc;
       tailState << local_target_pt, local_target_vel, Eigen::Vector3d::Zero();
 
+      Eigen::MatrixXd innerPs(3, piece_nums - 1);
+      Eigen::VectorXd piece_dur_vec = Eigen::VectorXd::Constant(piece_nums, t_to_lc_tgt / piece_nums);
+
       double t = piece_dur_vec(0);
+      double lc_start = traj_.local_traj.traj.getStartTime();
+      double glb_start = traj_.global_traj.traj.getStartTime();
       for (int i = 0; i < piece_nums - 1; ++i)
       {
         if (t < t_to_lc_end)
         {
-          innerPs.col(i) = traj_.local_traj.traj.getPos(t + passed_t_on_lctraj);
+          innerPs.col(i) = traj_.local_traj.traj.evaluate(lc_start + t + passed_t_on_lctraj, SplineTrajectory::Deriv::Pos);
         }
         else if (t <= t_to_lc_tgt)
         {
           double glb_t = t - t_to_lc_end + traj_.global_traj.last_glb_t_of_lc_tgt - traj_.global_traj.global_start_time;
-          innerPs.col(i) = traj_.global_traj.traj.getPos(glb_t);
+          innerPs.col(i) = traj_.global_traj.traj.evaluate(glb_start + glb_t, SplineTrajectory::Deriv::Pos);
         }
         else
         {
@@ -164,8 +377,9 @@ namespace ego_planner
         t += piece_dur_vec(i + 1);
       }
 
-      initMJO.reset(headState, tailState, piece_nums);
-      initMJO.generate(innerPs, piece_dur_vec);
+      initTraj = generateSplineTraj(headState, tailState, innerPs, piece_dur_vec);
+      outInnerPts = innerPs;
+      outDurations = piece_dur_vec;
     }
 
     return true;
@@ -182,12 +396,14 @@ namespace ego_planner
     traj_.global_traj.last_glb_t_of_lc_tgt = traj_.global_traj.glb_t_of_lc_tgt;
 
     double t_step = planning_horizen / 20 / pp_.max_vel_;
-    // double dist_min = 9999, dist_min_t = 0.0;
+    double glb_start = traj_.global_traj.traj.getStartTime();
+
     for (t = traj_.global_traj.glb_t_of_lc_tgt;
          t < (traj_.global_traj.global_start_time + traj_.global_traj.duration);
          t += t_step)
     {
-      Eigen::Vector3d pos_t = traj_.global_traj.traj.getPos(t - traj_.global_traj.global_start_time);
+      double local_t = t - traj_.global_traj.global_start_time;
+      Eigen::Vector3d pos_t = traj_.global_traj.traj.evaluate(glb_start + local_t, SplineTrajectory::Deriv::Pos);
       double dist = (pos_t - start_pt).norm();
 
       if (dist >= planning_horizen)
@@ -198,7 +414,7 @@ namespace ego_planner
       }
     }
 
-    if ((t - traj_.global_traj.global_start_time) >= traj_.global_traj.duration - 1e-5) // Last global point
+    if ((t - traj_.global_traj.global_start_time) >= traj_.global_traj.duration - 1e-5)
     {
       local_target_pos = global_end_pt;
       traj_.global_traj.glb_t_of_lc_tgt = traj_.global_traj.global_start_time + traj_.global_traj.duration;
@@ -211,175 +427,22 @@ namespace ego_planner
     }
     else
     {
-      local_target_vel = traj_.global_traj.traj.getVel(t - traj_.global_traj.global_start_time);
+      double local_t = t - traj_.global_traj.global_start_time;
+      local_target_vel = traj_.global_traj.traj.evaluate(glb_start + local_t, SplineTrajectory::Deriv::Vel);
     }
   }
 
-  bool EGOPlannerManager::setLocalTrajFromOpt(const poly_traj::MinJerkOpt &opt, const bool touch_goal)
+  bool EGOPlannerManager::setLocalTrajFromOpt(const PPoly3D &traj, const Eigen::VectorXd &durations, const bool touch_goal)
   {
-    poly_traj::Trajectory traj = opt.getTraj();
-    Eigen::MatrixXd cps = opt.getInitConstraintPoints(getCpsNumPrePiece());
+    Eigen::MatrixXd cps = ploy_traj_opt_->getInitConstraintPoints(traj, durations, getCpsNumPrePiece());
     PtsChk_t pts_to_check;
     bool ret = ploy_traj_opt_->computePointsToCheck(traj, ConstraintPoints::two_thirds_id(cps, touch_goal), pts_to_check);
-    if (ret)
+    if (ret && pts_to_check.size() >= 1 && pts_to_check.back().size() >= 1)
+    {
       traj_.setLocalTraj(traj, pts_to_check, ros::Time::now().toSec());
+    }
 
     return ret;
-  }
-
-  bool EGOPlannerManager::reboundReplan(
-      const Eigen::Vector3d &start_pt, const Eigen::Vector3d &start_vel,
-      const Eigen::Vector3d &start_acc, const Eigen::Vector3d &local_target_pt,
-      const Eigen::Vector3d &local_target_vel, const Eigen::Vector3d &object_pt,
-      const Eigen::Vector3d &object_vel,  const Eigen::Quaterniond &object_q, 
-      const Eigen::Vector3d &relative_track_pt, const bool flag_polyInit, 
-      const bool flag_randomPolyTraj, const bool touch_goal, const bool satrt_tracking)
-  {
-
-    static int count = 0;
-    printf("\033[47;30m\n[drone %d replan %d]==============================================\033[0m\n",
-           pp_.drone_id, count++);
-    // cout.precision(3);
-    // cout << "start: " << start_pt.transpose() << ", " << start_vel.transpose() << "\ngoal:" << local_target_pt.transpose() << ", " << local_target_vel.transpose()
-    //      << endl;
-
-    ploy_traj_opt_->setIfTouchGoal(touch_goal);
-    ploy_traj_opt_->setObject(object_pt, object_vel, object_q);
-    ploy_traj_opt_->setRelativeTrackingP(relative_track_pt);
-    ploy_traj_opt_->setStartTracking(satrt_tracking);
-
-    if ((start_pt - local_target_pt).norm() < 0.2)
-    {
-      cout << "Close to goal" << endl;
-      // continous_failures_count_++;
-      // return false;
-    }
-
-    ros::Time t_start = ros::Time::now();
-    ros::Duration t_init, t_opt;
-
-    /*** STEP 1: INIT ***/
-    double ts = pp_.polyTraj_piece_length / pp_.max_vel_;
-
-    poly_traj::MinJerkOpt initMJO;
-    if (!computeInitState(start_pt, start_vel, start_acc, local_target_pt, local_target_vel,
-                          flag_polyInit, flag_randomPolyTraj, ts, initMJO))
-    {
-      return false;
-    }
-
-    Eigen::MatrixXd cstr_pts = initMJO.getInitConstraintPoints(ploy_traj_opt_->get_cps_num_prePiece_());
-    vector<std::pair<int, int>> segments;
-    if (ploy_traj_opt_->finelyCheckAndSetConstraintPoints(segments, initMJO, true) == PolyTrajOptimizer::CHK_RET::ERR)
-    {
-      return false;
-    }
-
-    t_init = ros::Time::now() - t_start;
-
-    std::vector<Eigen::Vector3d> point_set;
-    for (int i = 0; i < cstr_pts.cols(); ++i)
-      point_set.push_back(cstr_pts.col(i));
-    visualization_->displayInitPathList(point_set, 0.2, 0);
-
-    t_start = ros::Time::now();
-
-    /*** STEP 2: OPTIMIZE ***/
-    bool flag_success = false;
-    vector<vector<Eigen::Vector3d>> vis_trajs;
-    poly_traj::MinJerkOpt best_MJO;
-
-    if (pp_.use_distinctive_trajs)
-    {
-      std::vector<ConstraintPoints> trajs = ploy_traj_opt_->distinctiveTrajs(segments);
-      cout << "\033[1;33m"
-           << "multi-trajs=" << trajs.size() << "\033[1;0m" << endl;
-
-      poly_traj::Trajectory initTraj = initMJO.getTraj();
-      int PN = initTraj.getPieceNum();
-      Eigen::MatrixXd all_pos = initTraj.getPositions();
-      Eigen::MatrixXd innerPts = all_pos.block(0, 1, 3, PN - 1);
-      Eigen::Matrix<double, 3, 3> headState, tailState;
-      headState << initTraj.getJuncPos(0), initTraj.getJuncVel(0), initTraj.getJuncAcc(0);
-      tailState << initTraj.getJuncPos(PN), initTraj.getJuncVel(PN), initTraj.getJuncAcc(PN);
-      double final_cost, min_cost = 999999.0;
-      for (int i = trajs.size() - 1; i >= 0; i--)
-      {
-        ploy_traj_opt_->setConstraintPoints(trajs[i]);
-        if (ploy_traj_opt_->optimizeTrajectory(headState, tailState,
-                                               innerPts, initTraj.getDurations(),
-                                               cstr_pts, final_cost))
-        {
-
-          cout << "traj " << trajs.size() - i << " success." << endl;
-
-          if (final_cost < min_cost)
-          {
-            min_cost = final_cost;
-            best_MJO = ploy_traj_opt_->getMinJerkOpt();
-          }
-
-          // visualization
-          Eigen::MatrixXd ctrl_pts_temp = ploy_traj_opt_->getMinJerkOpt().getInitConstraintPoints(ploy_traj_opt_->get_cps_num_prePiece_());
-          std::vector<Eigen::Vector3d> point_set;
-          for (int j = 0; j < ctrl_pts_temp.cols(); j++)
-          {
-            point_set.push_back(ctrl_pts_temp.col(j));
-          }
-          vis_trajs.push_back(point_set);
-        }
-        else
-        {
-          cout << "traj " << trajs.size() - i << " failed." << endl;
-        }
-      }
-
-      t_opt = ros::Time::now() - t_start;
-
-      visualization_->displayMultiInitPathList(vis_trajs, 0.2); // This visuallization will take up several milliseconds.
-    }
-    else
-    {
-      poly_traj::Trajectory initTraj = initMJO.getTraj();
-      int PN = initTraj.getPieceNum();
-      Eigen::MatrixXd all_pos = initTraj.getPositions();
-      Eigen::MatrixXd innerPts = all_pos.block(0, 1, 3, PN - 1);
-      Eigen::Matrix<double, 3, 3> headState, tailState;
-      headState << initTraj.getJuncPos(0), initTraj.getJuncVel(0), initTraj.getJuncAcc(0);
-      tailState << initTraj.getJuncPos(PN), initTraj.getJuncVel(PN), initTraj.getJuncAcc(PN);
-      double final_cost;
-      flag_success = ploy_traj_opt_->optimizeTrajectory(headState, tailState,
-                                                        innerPts, initTraj.getDurations(),
-                                                        cstr_pts, final_cost);
-      best_MJO = ploy_traj_opt_->getMinJerkOpt();
-
-      t_opt = ros::Time::now() - t_start;
-    }
-
-    // // save and display planned results
-    cout << "plan_success=" << flag_success << endl;
-    if (!flag_success)
-    {
-      visualization_->displayFailedList(cstr_pts, 0);
-      continous_failures_count_++;
-      return false;
-    }
-
-    static double sum_time = 0;
-    static int count_success = 0;
-    sum_time += (t_init + t_opt).toSec();
-    count_success++;
-    cout << "total time:\033[42m" << (t_init + t_opt).toSec()
-         << "\033[0m,init:" << t_init.toSec()
-         << ",optimize:" << t_opt.toSec()
-         << ",avg_time=" << sum_time / count_success << endl;
-
-    setLocalTrajFromOpt(best_MJO, touch_goal);
-    visualization_->displayOptimalList(cstr_pts, 0);
-
-    // success. YoY
-    continous_failures_count_ = 0;
-    return true;
   }
 
   bool EGOPlannerManager::EmergencyStop(Eigen::Vector3d stop_pos)
@@ -388,32 +451,37 @@ namespace ego_planner
     Eigen::Matrix<double, 3, 3> headState, tailState;
     headState << stop_pos, ZERO, ZERO;
     tailState = headState;
-    poly_traj::MinJerkOpt stopMJO;
-    stopMJO.reset(headState, tailState, 2);
-    stopMJO.generate(stop_pos, Eigen::Vector2d(1.0, 1.0));
+    Eigen::MatrixXd innerPs = stop_pos; // 3x1
+    Eigen::VectorXd durs = Eigen::Vector2d(1.0, 1.0);
 
-    setLocalTrajFromOpt(stopMJO, false);
+    PPoly3D stopTraj = generateSplineTraj(headState, tailState, innerPs, durs);
+    setLocalTrajFromOpt(stopTraj, durs, false);
 
     return true;
   }
 
   bool EGOPlannerManager::checkCollision(int drone_id)
   {
-    if (traj_.local_traj.start_time < 1e9) // It means my first planning has not started
+    if (traj_.local_traj.start_time < 1e9)
+      return false;
+    if (traj_.swarm_traj[drone_id].drone_id != drone_id)
       return false;
 
     double my_traj_start_time = traj_.local_traj.start_time;
     double other_traj_start_time = traj_.swarm_traj[drone_id].start_time;
 
-    double t_start = max(my_traj_start_time, other_traj_start_time);
-    double t_end = min(my_traj_start_time + traj_.local_traj.duration * 2 / 3,
-                       other_traj_start_time + traj_.swarm_traj[drone_id].duration);
+    double t_start = std::max(my_traj_start_time, other_traj_start_time);
+    double t_end = std::min(my_traj_start_time + traj_.local_traj.duration * 2 / 3,
+                            other_traj_start_time + traj_.swarm_traj[drone_id].duration);
+
+    double my_base = traj_.local_traj.traj.getStartTime();
+    double other_base = traj_.swarm_traj[drone_id].traj.getStartTime();
 
     for (double t = t_start; t < t_end; t += 0.03)
     {
-      if ((traj_.local_traj.traj.getPos(t - my_traj_start_time) -
-           traj_.swarm_traj[drone_id].traj.getPos(t - other_traj_start_time))
-              .norm() < getSwarmClearance())
+      if ((traj_.local_traj.traj.evaluate(my_base + (t - my_traj_start_time), SplineTrajectory::Deriv::Pos) -
+           traj_.swarm_traj[drone_id].traj.evaluate(other_base + (t - other_traj_start_time), SplineTrajectory::Deriv::Pos))
+              .norm() < (getSwarmClearance() + traj_.swarm_traj[drone_id].des_clearance))
       {
         return true;
       }
@@ -427,8 +495,6 @@ namespace ego_planner
       const Eigen::Vector3d &start_acc, const std::vector<Eigen::Vector3d> &waypoints,
       const Eigen::Vector3d &end_vel, const Eigen::Vector3d &end_acc)
   {
-
-    poly_traj::MinJerkOpt globalMJO;
     Eigen::Matrix<double, 3, 3> headState, tailState;
     headState << start_pos, start_vel, start_acc;
     tailState << waypoints.back(), end_vel, end_acc;
@@ -436,37 +502,26 @@ namespace ego_planner
 
     if (waypoints.size() > 1)
     {
-
       innerPts.resize(3, waypoints.size() - 1);
       for (int i = 0; i < (int)waypoints.size() - 1; ++i)
-      {
         innerPts.col(i) = waypoints[i];
-      }
     }
-    else
-    {
-      if (innerPts.size() != 0)
-      {
-        ROS_ERROR("innerPts.size() != 0");
-      }
-    }
-
-    globalMJO.reset(headState, tailState, waypoints.size());
 
     double des_vel = pp_.max_vel_ / 1.5;
     Eigen::VectorXd time_vec(waypoints.size());
 
+    PPoly3D globalTraj;
     for (int j = 0; j < 2; ++j)
     {
       for (size_t i = 0; i < waypoints.size(); ++i)
       {
         time_vec(i) = (i == 0) ? (waypoints[0] - start_pos).norm() / des_vel
-                               : (waypoints[i] - waypoints[i - 1]).norm() / des_vel;
+                                : (waypoints[i] - waypoints[i - 1]).norm() / des_vel;
       }
 
-      globalMJO.generate(innerPts, time_vec);
+      globalTraj = generateSplineTraj(headState, tailState, innerPts, time_vec);
 
-      if (globalMJO.getTraj().getMaxVelRate() < pp_.max_vel_ ||
+      if (getMaxVelRate(globalTraj) < pp_.max_vel_ ||
           start_vel.norm() > pp_.max_vel_ ||
           end_vel.norm() > pp_.max_vel_)
       {
@@ -475,18 +530,14 @@ namespace ego_planner
 
       if (j == 2)
       {
-        ROS_WARN("Global traj MaxVel = %f > set_max_vel", globalMJO.getTraj().getMaxVelRate());
-        cout << "headState=" << endl
-             << headState << endl;
-        cout << "tailState=" << endl
-             << tailState << endl;
+        ROS_WARN("Global traj MaxVel = %f > set_max_vel", getMaxVelRate(globalTraj));
       }
 
       des_vel /= 1.5;
     }
 
     auto time_now = ros::Time::now();
-    traj_.setGlobalTraj(globalMJO.getTraj(), time_now.toSec());
+    traj_.setGlobalTraj(globalTraj, time_now.toSec());
 
     return true;
   }

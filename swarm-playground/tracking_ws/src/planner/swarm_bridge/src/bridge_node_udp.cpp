@@ -6,7 +6,7 @@
 #include <iostream>
 #include <nav_msgs/Odometry.h>
 #include <std_msgs/Empty.h>
-#include <traj_utils/MINCOTraj.h>
+#include <traj_utils/PolyTraj.h>
 #include <quadrotor_msgs/GoalSet.h>
 #include <sensor_msgs/Joy.h>
 
@@ -29,7 +29,7 @@ double odom_broadcast_freq_;
 char udp_recv_buf_[BUF_LEN], udp_send_buf_[BUF_LEN];
 struct sockaddr_in addr_udp_send_;
 nav_msgs::Odometry odom_msg_;
-traj_utils::MINCOTraj MINCOTraj_msg_;
+traj_utils::PolyTraj poly_traj_msg_;
 std_msgs::Empty stop_msg_;
 quadrotor_msgs::GoalSet goal_msg_;
 sensor_msgs::Joy joy_msg_;
@@ -162,9 +162,8 @@ void odom_sub_udp_cb(const nav_msgs::OdometryPtr &msg)
   }
 }
 
-void one_traj_sub_udp_cb(const traj_utils::MINCOTrajPtr &msg)
+void one_traj_sub_udp_cb(const traj_utils::PolyTrajPtr &msg)
 {
-
   int len = serializeTopic(MESSAGE_TYPE::ONE_TRAJ, *msg);
 
   if (sendto(udp_send_fd_, udp_send_buf_, len, 0, (struct sockaddr *)&addr_udp_send_, sizeof(addr_udp_send_)) <= 0)
@@ -249,9 +248,9 @@ void udp_recv_fun()
     case MESSAGE_TYPE::ONE_TRAJ:
     {
 
-      if (valread == deserializeTopic(MINCOTraj_msg_))
+      if (valread == deserializeTopic(poly_traj_msg_))
       {
-        one_traj_pub_.publish(MINCOTraj_msg_);
+        one_traj_pub_.publish(poly_traj_msg_);
       }
       else
       {
@@ -338,7 +337,7 @@ int main(int argc, char **argv)
   other_odoms_pub_ = nh.advertise<nav_msgs::Odometry>("/others_odom", 10);
 
   one_traj_sub_ = nh.subscribe("/broadcast_traj_from_planner", 100, one_traj_sub_udp_cb, ros::TransportHints().tcpNoDelay());
-  one_traj_pub_ = nh.advertise<traj_utils::MINCOTraj>("/broadcast_traj_to_planner", 100);
+  one_traj_pub_ = nh.advertise<traj_utils::PolyTraj>("/broadcast_traj_to_planner", 100);
 
   // mandatory_stop_sub_ = nh.subscribe("/mandatory_stop_from_users", 100, mandatory_stop_sub_udp_cb, ros::TransportHints().tcpNoDelay());
   // mandatory_stop_pub_ = nh.advertise<std_msgs::Empty>("/mandatory_stop_to_planner", 100);
