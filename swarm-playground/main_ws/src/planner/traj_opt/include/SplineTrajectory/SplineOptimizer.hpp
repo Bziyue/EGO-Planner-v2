@@ -125,6 +125,93 @@ namespace SplineTrajectory
         double operator()(const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> &waypoints,
                           Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> &grad_q) const;
     };
+
+
+    /**
+     * @brief SampleCostProtocol [NEW]
+     * Functor to compute costs on the discrete samples collected during integral evaluation.
+     * The functor should write gradients with respect to sample positions and global time.
+     */
+    struct SampleCostProtocol
+    {
+        template <typename SamplesType>
+        double operator()(const SamplesType &samples,
+                          Eigen::Matrix<double, 3, Eigen::Dynamic> &grad_p,
+                          Eigen::VectorXd &grad_t_global) const;
+    };
+
+    /**
+     * @brief TrajectoryCostProtocol
+     * Functor to compute costs that depend on the entire working spline state,
+     * not just pointwise samples. This is useful for costs involving
+     * accumulated/integrated states, cross-segment coupling, or custom
+     * gradient propagation schemes.
+     *
+     * The functor should add its contribution directly into @p grads.
+     */
+    struct TrajectoryCostProtocol
+    {
+        /**
+         * @param spline      Working spline built from current optimization vars
+         * @param Ts          Physical durations of all segments
+         * @param waypoints   Working waypoint matrix
+         * @param start_time  Global start time
+         * @param bc          Working boundary conditions
+         * @param grads       [In/Out] Gradients in spline state space
+         * @return            Scalar cost value
+         */
+        double operator()(const QuinticSplineND<3> &spline,
+                          const std::vector<double> &Ts,
+                          const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> &waypoints,
+                          double start_time,
+                          const BoundaryConditions<3> &bc,
+                          QuinticSplineND<3>::Gradients &grads) const;
+    };
+
+    /**
+     * @brief AuxiliaryStateMap Protocol [NEW]
+     * Adds an optional extra optimization variable block that can modify the
+     * effective spline state before evaluation, and map gradients back after
+     * spline back-propagation.
+     *
+     * Typical use cases:
+     * - A shared total-time variable that overrides segment times
+     * - A trajectory splice/start-state variable sampled from an external motion
+     * - Other low-dimensional variables that affect waypoints / boundary states
+     *
+     * The optimizer owns the canonical reference state. The auxiliary map:
+     * 1) provides the initial unconstrained auxiliary variables
+     * 2) applies them onto the working state before spline.update(...)
+     * 3) pulls gradients back from the working state after spline.propagateGrad(...)
+     */
+    struct AuxiliaryStateMapProtocol
+    {
+        // Dimension of the auxiliary optimization variable block.
+        int getDimension() const;
+
+        // Create initial unconstrained auxiliary variables from the reference state.
+        Eigen::VectorXd getInitialValue(const std::vector<double> &ref_times,
+                                        const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> &ref_waypoints,
+                                        double ref_start_time,
+                                        const BoundaryConditions<3> &ref_bc) const;
+
+        // Apply the auxiliary variables onto the working state before spline update.
+        void apply(const Eigen::VectorXd &z,
+                   std::vector<double> &times,
+                   Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> &waypoints,
+                   double &start_time,
+                   BoundaryConditions<3> &bc) const;
+
+        // Back-propagate gradients from the working state to z.
+        double backward(const Eigen::VectorXd &z,
+                        const QuinticSplineND<3> &spline,
+                        const std::vector<double> &times,
+                        const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> &waypoints,
+                        double start_time,
+                        const BoundaryConditions<3> &bc,
+                        QuinticSplineND<3>::Gradients &grads,
+                        Eigen::VectorXd &grad_z) const;
+    };
 #endif
 
     namespace TypeTraits
@@ -192,6 +279,21 @@ namespace SplineTrajectory
             )))
         >> : std::true_type {};
 
+        template <typename T, typename SplineType, int DIM, typename = void>
+        struct HasTrajectoryCostInterface : std::false_type {};
+
+        template <typename T, typename SplineType, int DIM>
+        struct HasTrajectoryCostInterface<T, SplineType, DIM, void_t<
+            decltype(static_cast<double>(std::declval<T>()(
+                std::declval<const SplineType &>(),
+                std::declval<const std::vector<double> &>(),
+                std::declval<const typename SplineType::MatrixType &>(),
+                std::declval<double>(),
+                std::declval<const BoundaryConditions<DIM> &>(),
+                std::declval<typename SplineType::Gradients &>()
+            )))
+        >> : std::true_type {};
+
         template <typename T, typename VecT, typename = void>
         struct HasIntegralCostInterface : std::false_type {};
 
@@ -214,6 +316,47 @@ namespace SplineTrajectory
                 std::declval<VecT &>(),                  // gs
                 std::declval<double &>()                 // gt
             )))
+        >> : std::true_type {};
+
+
+        template <typename T, typename SamplesType, typename GradMatrixType, typename = void>
+        struct HasSampleCostInterface : std::false_type {};
+
+        template <typename T, typename SamplesType, typename GradMatrixType>
+        struct HasSampleCostInterface<T, SamplesType, GradMatrixType, void_t<
+            decltype(static_cast<double>(std::declval<T>()(
+                std::declval<const SamplesType &>(),
+                std::declval<GradMatrixType &>(),
+                std::declval<Eigen::VectorXd &>()
+            )))
+        >> : std::true_type {};
+
+        template <typename T, int DIM, typename SplineType, typename = void>
+        struct HasAuxiliaryStateMapInterface : std::false_type {};
+
+        template <typename T, int DIM, typename SplineType>
+        struct HasAuxiliaryStateMapInterface<T, DIM, SplineType, void_t<
+            decltype(static_cast<int>(std::declval<T>().getDimension())),
+            decltype(std::declval<T>().getInitialValue(
+                std::declval<const std::vector<double> &>(),
+                std::declval<const typename SplineType::MatrixType &>(),
+                std::declval<double>(),
+                std::declval<const BoundaryConditions<DIM> &>())),
+            decltype(std::declval<T>().apply(
+                std::declval<const Eigen::VectorXd &>(),
+                std::declval<std::vector<double> &>(),
+                std::declval<typename SplineType::MatrixType &>(),
+                std::declval<double &>(),
+                std::declval<BoundaryConditions<DIM> &>())),
+            decltype(static_cast<double>(std::declval<T>().backward(
+                std::declval<const Eigen::VectorXd &>(),
+                std::declval<const SplineType &>(),
+                std::declval<const std::vector<double> &>(),
+                std::declval<const typename SplineType::MatrixType &>(),
+                std::declval<double>(),
+                std::declval<const BoundaryConditions<DIM> &>(),
+                std::declval<typename SplineType::Gradients &>(),
+                std::declval<Eigen::VectorXd &>())))
         >> : std::true_type {};
     }
 
@@ -335,6 +478,58 @@ namespace SplineTrajectory
         }
     };
 
+    template <typename SplineType, int DIM>
+    struct VoidTrajectoryCost
+    {
+        double operator()(const SplineType & /*spline*/,
+                          const std::vector<double> & /*times*/,
+                          const typename SplineType::MatrixType & /*waypoints*/,
+                          double /*start_time*/,
+                          const BoundaryConditions<DIM> & /*bc*/,
+                          typename SplineType::Gradients & /*grads*/) const
+        {
+            return 0.0;
+        }
+    };
+
+    template <int DIM, typename SplineType>
+    struct VoidAuxiliaryStateMap
+    {
+        using WaypointsType = typename SplineType::MatrixType;
+        using Gradients = typename SplineType::Gradients;
+
+        int getDimension() const { return 0; }
+
+        Eigen::VectorXd getInitialValue(const std::vector<double> & /*ref_times*/,
+                                        const WaypointsType & /*ref_waypoints*/,
+                                        double /*ref_start_time*/,
+                                        const BoundaryConditions<DIM> & /*ref_bc*/) const
+        {
+            return Eigen::VectorXd();
+        }
+
+        void apply(const Eigen::VectorXd & /*z*/,
+                   std::vector<double> & /*times*/,
+                   WaypointsType & /*waypoints*/,
+                   double & /*start_time*/,
+                   BoundaryConditions<DIM> & /*bc*/) const
+        {
+        }
+
+        double backward(const Eigen::VectorXd & /*z*/,
+                        const SplineType & /*spline*/,
+                        const std::vector<double> & /*times*/,
+                        const WaypointsType & /*waypoints*/,
+                        double /*start_time*/,
+                        const BoundaryConditions<DIM> & /*bc*/,
+                        Gradients & /*grads*/,
+                        Eigen::VectorXd &grad_z) const
+        {
+            grad_z.resize(0);
+            return 0.0;
+        }
+    };
+
     struct OptimizationFlags
     {
         bool start_p = false;
@@ -350,7 +545,8 @@ namespace SplineTrajectory
     template <int DIM,
               typename SplineType = QuinticSplineND<DIM>,
               typename TimeMap = QuadInvTimeMap,
-              typename SpatialMap = IdentitySpatialMap<DIM>>
+              typename SpatialMap = IdentitySpatialMap<DIM>,
+              typename AuxiliaryStateMap = VoidAuxiliaryStateMap<DIM, SplineType>>
     class SplineOptimizer
     {
         static_assert(TypeTraits::HasTimeMapInterface<TimeMap>::value,
@@ -363,6 +559,10 @@ namespace SplineTrajectory
         static_assert(TypeTraits::HasSpatialMapInterface<SpatialMap, DIM>::value,
                       "\n[SplineOptimizer Error] The provided 'SpatialMap' type does not satisfy the required interface.\n"
                       "It must implement toPhysical, toUnconstrained, and backwardGrad methods.\n");
+
+        static_assert(TypeTraits::HasAuxiliaryStateMapInterface<AuxiliaryStateMap, DIM, SplineType>::value,
+                      "\n[SplineOptimizer Error] The provided 'AuxiliaryStateMap' type does not satisfy the required interface.\n"
+                      "It must implement getDimension, getInitialValue, apply, and backward methods.\n");
 
     public:
         using VectorType = typename SplineType::VectorType;
@@ -470,15 +670,18 @@ namespace SplineTrajectory
 
         TimeMap default_time_map_;
         SpatialMap default_spatial_map_;
+        AuxiliaryStateMap default_auxiliary_state_map_;
 
         const TimeMap* active_time_map_ = nullptr;
         const SpatialMap* active_spatial_map_ = nullptr;
+        const AuxiliaryStateMap* active_auxiliary_state_map_ = nullptr;
 
         mutable std::unique_ptr<Workspace> internal_ws_;
         
         mutable std::string last_error_message_;
         mutable std::vector<SpatialVariableLayout> spatial_layout_;
         mutable int derivatives_offset_ = 0;
+        mutable int auxiliary_offset_ = 0;
         mutable int total_dimension_ = 0;
         mutable bool layout_dirty_ = true;
         
@@ -545,6 +748,7 @@ namespace SplineTrajectory
             if (num_segments_ <= 0)
             {
                 derivatives_offset_ = 0;
+                auxiliary_offset_ = 0;
                 total_dimension_ = 0;
                 layout_dirty_ = false;
                 return;
@@ -564,7 +768,8 @@ namespace SplineTrajectory
             }
 
             derivatives_offset_ = offset;
-            total_dimension_ = derivatives_offset_ + countOptimizedDerivativeBlocks() * DIM;
+            auxiliary_offset_ = derivatives_offset_ + countOptimizedDerivativeBlocks() * DIM;
+            total_dimension_ = auxiliary_offset_ + active_auxiliary_state_map_->getDimension();
             layout_dirty_ = false;
         }
 
@@ -584,6 +789,7 @@ namespace SplineTrajectory
         {
             active_time_map_ = &default_time_map_;
             active_spatial_map_ = &default_spatial_map_;
+            active_auxiliary_state_map_ = &default_auxiliary_state_map_;
         }
 
         SplineOptimizer(const SplineOptimizer &other)
@@ -598,8 +804,10 @@ namespace SplineTrajectory
               integral_num_steps_(other.integral_num_steps_),
               default_time_map_(other.default_time_map_),
               default_spatial_map_(other.default_spatial_map_),
+              default_auxiliary_state_map_(other.default_auxiliary_state_map_),
               spatial_layout_(other.spatial_layout_),
               derivatives_offset_(other.derivatives_offset_),
+              auxiliary_offset_(other.auxiliary_offset_),
               total_dimension_(other.total_dimension_),
               layout_dirty_(other.layout_dirty_)
         {
@@ -609,6 +817,9 @@ namespace SplineTrajectory
             active_spatial_map_ = (other.active_spatial_map_ == &other.default_spatial_map_)
                                   ? &default_spatial_map_
                                   : other.active_spatial_map_;
+            active_auxiliary_state_map_ = (other.active_auxiliary_state_map_ == &other.default_auxiliary_state_map_)
+                                          ? &default_auxiliary_state_map_
+                                          : other.active_auxiliary_state_map_;
 
             if (other.internal_ws_)
                 internal_ws_ = std::unique_ptr<Workspace>(new Workspace(*other.internal_ws_));
@@ -629,8 +840,10 @@ namespace SplineTrajectory
                 integral_num_steps_ = other.integral_num_steps_;
                 default_time_map_ = other.default_time_map_;
                 default_spatial_map_ = other.default_spatial_map_;
+                default_auxiliary_state_map_ = other.default_auxiliary_state_map_;
                 spatial_layout_ = other.spatial_layout_;
                 derivatives_offset_ = other.derivatives_offset_;
+                auxiliary_offset_ = other.auxiliary_offset_;
                 total_dimension_ = other.total_dimension_;
                 layout_dirty_ = other.layout_dirty_;
 
@@ -640,6 +853,9 @@ namespace SplineTrajectory
                 active_spatial_map_ = (other.active_spatial_map_ == &other.default_spatial_map_)
                                       ? &default_spatial_map_
                                       : other.active_spatial_map_;
+                active_auxiliary_state_map_ = (other.active_auxiliary_state_map_ == &other.default_auxiliary_state_map_)
+                                              ? &default_auxiliary_state_map_
+                                              : other.active_auxiliary_state_map_;
 
                 if (other.internal_ws_)
                     internal_ws_ = std::unique_ptr<Workspace>(new Workspace(*other.internal_ws_));
@@ -667,6 +883,17 @@ namespace SplineTrajectory
         void setSpatialMap(const SpatialMap* map)
         {
             active_spatial_map_ = (map != nullptr) ? map : &default_spatial_map_;
+            markLayoutDirty();
+        }
+
+        /**
+         * @brief Set the AuxiliaryStateMap for optional extra optimization variables.
+         * @param map Pointer to an AuxiliaryStateMap instance (can be nullptr to reset to default).
+         * The optimizer does not take ownership; the map must remain valid.
+         */
+        void setAuxiliaryStateMap(const AuxiliaryStateMap* map)
+        {
+            active_auxiliary_state_map_ = (map != nullptr) ? map : &default_auxiliary_state_map_;
             markLayoutDirty();
         }
 
@@ -733,11 +960,13 @@ namespace SplineTrajectory
         }
         void setEnergyWeights(double rho_energy) { rho_energy_ = rho_energy; }
         void setIntegralNumSteps(int steps) { integral_num_steps_ = steps; }
+
         void setCollectIntegralSamples(bool enable, Workspace *ws = nullptr) const
         {
             Workspace& ws_ref = (ws != nullptr) ? *ws : *getOrCreateInternalWorkspace();
             ws_ref.collect_integral_samples = enable;
         }
+
         const IntegralSampleBuffer &getIntegralSamples(Workspace *ws = nullptr) const
         {
             Workspace& ws_ref = (ws != nullptr) ? *ws : *getOrCreateInternalWorkspace();
@@ -881,19 +1110,27 @@ namespace SplineTrajectory
                 offset += DIM;
             });
 
+            const int aux_dim = active_auxiliary_state_map_->getDimension();
+            if (aux_dim > 0)
+            {
+                x.segment(auxiliary_offset_, aux_dim) =
+                    active_auxiliary_state_map_->getInitialValue(ref_times_, ref_waypoints_, start_time_, ref_bc_);
+            }
+
             return x;
         }
 
         /**
-         * @brief Internal evaluate implementation that also supports discrete sample-space costs.
+         * @brief Internal evaluate implementation that supports both whole-spline and sample-space costs.
          */
         template <typename TimeCostFunc, typename WaypointsCostFunc, typename IntegralCostFunc,
-                  typename SampleCostFunc, typename Executor = SerialExecutor>
+                  typename SampleCostFunc, typename TrajectoryCostFunc, typename Executor = SerialExecutor>
         double evaluateWithSampleCostImpl(const Eigen::VectorXd &x, Eigen::VectorXd &grad_out,
                                           TimeCostFunc &&time_cost_func,
                                           WaypointsCostFunc &&waypoints_cost_func,
                                           IntegralCostFunc &&integral_cost_func,
                                           SampleCostFunc &&sample_cost_func,
+                                          TrajectoryCostFunc &&trajectory_cost_func,
                                           Workspace *ws,
                                           const Executor& executor = Executor()) const
         {
@@ -901,25 +1138,27 @@ namespace SplineTrajectory
             using WCF = typename std::decay<WaypointsCostFunc>::type;
             using ICF = typename std::decay<IntegralCostFunc>::type;
             using SampleCF = typename std::decay<SampleCostFunc>::type;
+            using TrCF = typename std::decay<TrajectoryCostFunc>::type;
             constexpr bool kSupportsMatrixWaypointsCost =
                 TypeTraits::HasWaypointsCostInterface<WCF, WaypointsType>::value;
 
             static_assert(TypeTraits::HasTimeCostInterface<TCF>::value,
-                          "\n[SplineOptimizer Error] 'TimeCostFunc' signature mismatch.\n"
-                          "Required: double operator()(const vector<double>& Ts, VectorXd &grad)\n");
+                          "[SplineOptimizer Error] 'TimeCostFunc' signature mismatch.");
 
             static_assert(kSupportsMatrixWaypointsCost,
-                          "\n[SplineOptimizer Error] 'WaypointsCostFunc' signature mismatch.\n"
-                          "Required: double operator()(const MatrixType& qs, MatrixXd &grad_q)\n");
+                          "[SplineOptimizer Error] 'WaypointsCostFunc' signature mismatch.");
 
             static_assert(TypeTraits::HasIntegralCostInterface<ICF, VectorType>::value,
-                          "\n[SplineOptimizer Error] 'IntegralCostFunc' signature mismatch.\n");
+                          "[SplineOptimizer Error] 'IntegralCostFunc' signature mismatch.");
+
+            static_assert(TypeTraits::HasSampleCostInterface<SampleCF, IntegralSampleBuffer, SampleGradMatrix>::value,
+                          "[SplineOptimizer Error] 'SampleCostFunc' signature mismatch.");
+
+            static_assert(TypeTraits::HasTrajectoryCostInterface<TrCF, SplineType, DIM>::value,
+                          "[SplineOptimizer Error] 'TrajectoryCostFunc' signature mismatch.");
 
             static_assert(TypeTraits::HasExecutorInterface<Executor>::value,
-                          "\n[SplineOptimizer Error] 'Executor' signature mismatch.\n"
-                          "The Executor must implement:\n"
-                          "  void operator()(int start, int end, Func&& f) const;\n"
-                          "where 'f' is a callable accepting an 'int' index.\n");
+                          "[SplineOptimizer Error] 'Executor' signature mismatch.");
             ensureLayoutCache();
 
             Workspace& ws_ref = (ws != nullptr) ? *ws : *getOrCreateInternalWorkspace();
@@ -941,6 +1180,7 @@ namespace SplineTrajectory
             }
 
             BoundaryConditions<DIM> current_bc = ref_bc_;
+            double current_start_time = start_time_;
             int offset = derivatives_offset_;
             auto apply_derivatives_forward = [&](auto&& op) {
                 if (flags_.start_v) op(current_bc.start_velocity);
@@ -957,7 +1197,19 @@ namespace SplineTrajectory
                 offset += DIM;
             });
 
-            ws_ref.spline.update(ws_ref.cache_times, ws_ref.cache_waypoints, start_time_, current_bc);
+            const int aux_dim = active_auxiliary_state_map_->getDimension();
+            Eigen::VectorXd auxiliary_vars;
+            if (aux_dim > 0)
+            {
+                auxiliary_vars = x.segment(auxiliary_offset_, aux_dim);
+                active_auxiliary_state_map_->apply(auxiliary_vars,
+                                                   ws_ref.cache_times,
+                                                   ws_ref.cache_waypoints,
+                                                   current_start_time,
+                                                   current_bc);
+            }
+
+            ws_ref.spline.update(ws_ref.cache_times, ws_ref.cache_waypoints, current_start_time, current_bc);
 
             ws_ref.user_gdT_buffer.setZero();
             ws_ref.cache_gdT.setZero();
@@ -967,9 +1219,9 @@ namespace SplineTrajectory
             ws_ref.cache_gdC.setZero();
             const bool need_samples =
                 ws_ref.collect_integral_samples || !std::is_same_v<SampleCF, VoidSampleCost>;
-
             calculateIntegralCost(ws_ref, ws_ref.cache_gdC, ws_ref.cache_gdT, total_cost,
                                   std::forward<IntegralCostFunc>(integral_cost_func),
+                                  current_start_time,
                                   need_samples,
                                   executor);
 
@@ -996,6 +1248,13 @@ namespace SplineTrajectory
             }
 
             ws_ref.spline.propagateGrad(ws_ref.cache_gdC, ws_ref.cache_gdT, ws_ref.grads);
+
+            total_cost += trajectory_cost_func(ws_ref.spline,
+                                               ws_ref.cache_times,
+                                               ws_ref.cache_waypoints,
+                                               current_start_time,
+                                               current_bc,
+                                               ws_ref.grads);
 
             if constexpr (!std::is_same_v<WCF, VoidWaypointsCost>)
             {
@@ -1032,6 +1291,25 @@ namespace SplineTrajectory
                 ws_ref.grads.end.v += rho_energy_ * ws_ref.energy_grads.end.v;
                 if constexpr (SplineType::ORDER >= 5) ws_ref.grads.end.a += rho_energy_ * ws_ref.energy_grads.end.a;
                 if constexpr (SplineType::ORDER >= 7) ws_ref.grads.end.j += rho_energy_ * ws_ref.energy_grads.end.j;
+            }
+
+            if (aux_dim > 0)
+            {
+                Eigen::VectorXd auxiliary_grad;
+                total_cost += active_auxiliary_state_map_->backward(auxiliary_vars,
+                                                                    ws_ref.spline,
+                                                                    ws_ref.cache_times,
+                                                                    ws_ref.cache_waypoints,
+                                                                    current_start_time,
+                                                                    current_bc,
+                                                                    ws_ref.grads,
+                                                                    auxiliary_grad);
+                if (auxiliary_grad.size() != aux_dim)
+                {
+                    auxiliary_grad.conservativeResize(aux_dim);
+                    auxiliary_grad.setZero();
+                }
+                grad_out.segment(auxiliary_offset_, aux_dim) = auxiliary_grad;
             }
 
             for (int i = 0; i < num_segments_; ++i)
@@ -1084,11 +1362,44 @@ namespace SplineTrajectory
         }
 
         /**
+         * @brief Primary evaluate: 4 cost functions with optional Workspace and Executor.
+         */
+        template <typename TimeCostFunc, typename WaypointsCostFunc, typename IntegralCostFunc,
+                  typename TrajectoryCostFunc = VoidTrajectoryCost<SplineType, DIM>,
+                  typename Executor = SerialExecutor,
+                  typename std::enable_if<
+                      TypeTraits::HasTrajectoryCostInterface<typename std::decay<TrajectoryCostFunc>::type,
+                                                             SplineType, DIM>::value,
+                      int>::type = 0>
+        double evaluate(const Eigen::VectorXd &x, Eigen::VectorXd &grad_out,
+                        TimeCostFunc &&time_cost_func,
+                        WaypointsCostFunc &&waypoints_cost_func,
+                        IntegralCostFunc &&integral_cost_func,
+                        TrajectoryCostFunc &&trajectory_cost_func,
+                        Workspace *ws = nullptr,
+                        const Executor& executor = Executor()) const
+        {
+            return evaluateWithSampleCostImpl(x, grad_out,
+                                              std::forward<TimeCostFunc>(time_cost_func),
+                                              std::forward<WaypointsCostFunc>(waypoints_cost_func),
+                                              std::forward<IntegralCostFunc>(integral_cost_func),
+                                              VoidSampleCost(),
+                                              std::forward<TrajectoryCostFunc>(trajectory_cost_func),
+                                              ws,
+                                              executor);
+        }
+
+        /**
          * @brief Evaluate with an additional sample-space cost.
          * The workspace argument is explicit to avoid ambiguity with the legacy evaluate overloads.
          */
         template <typename TimeCostFunc, typename WaypointsCostFunc, typename IntegralCostFunc,
-                  typename SampleCostFunc, typename Executor = SerialExecutor>
+                  typename SampleCostFunc, typename Executor = SerialExecutor,
+                  typename std::enable_if<
+                      TypeTraits::HasSampleCostInterface<typename std::decay<SampleCostFunc>::type,
+                                                         IntegralSampleBuffer,
+                                                         SampleGradMatrix>::value,
+                      int>::type = 0>
         double evaluate(const Eigen::VectorXd &x, Eigen::VectorXd &grad_out,
                         TimeCostFunc &&time_cost_func,
                         WaypointsCostFunc &&waypoints_cost_func,
@@ -1102,20 +1413,29 @@ namespace SplineTrajectory
                                               std::forward<WaypointsCostFunc>(waypoints_cost_func),
                                               std::forward<IntegralCostFunc>(integral_cost_func),
                                               std::forward<SampleCostFunc>(sample_cost_func),
+                                              VoidTrajectoryCost<SplineType, DIM>(),
                                               ws,
                                               executor);
         }
 
         /**
-         * @brief Primary evaluate: 3 cost functions with optional Workspace and Executor.
-         * Preserves the original API and forwards to the sample-aware implementation.
+         * @brief Evaluate with both whole-spline and sample-space costs enabled.
          */
         template <typename TimeCostFunc, typename WaypointsCostFunc, typename IntegralCostFunc,
-                  typename Executor = SerialExecutor>
+                  typename TrajectoryCostFunc, typename SampleCostFunc, typename Executor = SerialExecutor,
+                  typename std::enable_if<
+                      TypeTraits::HasTrajectoryCostInterface<typename std::decay<TrajectoryCostFunc>::type,
+                                                             SplineType, DIM>::value &&
+                      TypeTraits::HasSampleCostInterface<typename std::decay<SampleCostFunc>::type,
+                                                         IntegralSampleBuffer,
+                                                         SampleGradMatrix>::value,
+                      int>::type = 0>
         double evaluate(const Eigen::VectorXd &x, Eigen::VectorXd &grad_out,
                         TimeCostFunc &&time_cost_func,
                         WaypointsCostFunc &&waypoints_cost_func,
                         IntegralCostFunc &&integral_cost_func,
+                        TrajectoryCostFunc &&trajectory_cost_func,
+                        SampleCostFunc &&sample_cost_func,
                         Workspace *ws = nullptr,
                         const Executor& executor = Executor()) const
         {
@@ -1123,31 +1443,111 @@ namespace SplineTrajectory
                                               std::forward<TimeCostFunc>(time_cost_func),
                                               std::forward<WaypointsCostFunc>(waypoints_cost_func),
                                               std::forward<IntegralCostFunc>(integral_cost_func),
-                                              VoidSampleCost(),
+                                              std::forward<SampleCostFunc>(sample_cost_func),
+                                              std::forward<TrajectoryCostFunc>(trajectory_cost_func),
                                               ws,
                                               executor);
         }
 
         /**
-         * @brief Secondary evaluate: 2 cost functions (no waypoints cost).
-         * Forwards to primary evaluate with VoidWaypointsCost and VoidSampleCost.
+         * @brief Secondary evaluate: 3 cost functions without discrete waypoints cost.
+         * Forwards to primary evaluate with VoidWaypointsCost.
+         */
+        template <typename TimeCostFunc, typename IntegralCostFunc,
+                  typename TrajectoryCostFunc = VoidTrajectoryCost<SplineType, DIM>,
+                  typename Executor = SerialExecutor,
+                  typename std::enable_if<
+                      TypeTraits::HasTrajectoryCostInterface<typename std::decay<TrajectoryCostFunc>::type,
+                                                             SplineType, DIM>::value,
+                      int>::type = 0>
+        double evaluate(const Eigen::VectorXd &x, Eigen::VectorXd &grad_out,
+                        TimeCostFunc &&time_cost_func,
+                        IntegralCostFunc &&integral_cost_func,
+                        TrajectoryCostFunc &&trajectory_cost_func,
+                        Workspace *ws = nullptr,
+                        const Executor& executor = Executor()) const
+        {
+            return evaluate(x, grad_out,
+                            std::forward<TimeCostFunc>(time_cost_func),
+                            VoidWaypointsCost(),
+                            std::forward<IntegralCostFunc>(integral_cost_func),
+                            std::forward<TrajectoryCostFunc>(trajectory_cost_func),
+                            ws, executor);
+        }
+
+        /**
+         * @brief Secondary evaluate: time/integral/sample without discrete waypoint or whole-spline costs.
+         */
+        template <typename TimeCostFunc, typename IntegralCostFunc,
+                  typename SampleCostFunc, typename Executor = SerialExecutor,
+                  typename std::enable_if<
+                      TypeTraits::HasSampleCostInterface<typename std::decay<SampleCostFunc>::type,
+                                                         IntegralSampleBuffer,
+                                                         SampleGradMatrix>::value,
+                      int>::type = 0>
+        double evaluate(const Eigen::VectorXd &x, Eigen::VectorXd &grad_out,
+                        TimeCostFunc &&time_cost_func,
+                        IntegralCostFunc &&integral_cost_func,
+                        SampleCostFunc &&sample_cost_func,
+                        Workspace *ws,
+                        const Executor& executor = Executor()) const
+        {
+            return evaluate(x, grad_out,
+                            std::forward<TimeCostFunc>(time_cost_func),
+                            VoidWaypointsCost(),
+                            std::forward<IntegralCostFunc>(integral_cost_func),
+                            std::forward<SampleCostFunc>(sample_cost_func),
+                            ws,
+                            executor);
+        }
+
+        /**
+         * @brief Secondary evaluate: time/integral with both whole-spline and sample-space costs.
+         */
+        template <typename TimeCostFunc, typename IntegralCostFunc,
+                  typename TrajectoryCostFunc, typename SampleCostFunc, typename Executor = SerialExecutor,
+                  typename std::enable_if<
+                      TypeTraits::HasTrajectoryCostInterface<typename std::decay<TrajectoryCostFunc>::type,
+                                                             SplineType, DIM>::value &&
+                      TypeTraits::HasSampleCostInterface<typename std::decay<SampleCostFunc>::type,
+                                                         IntegralSampleBuffer,
+                                                         SampleGradMatrix>::value,
+                      int>::type = 0>
+        double evaluate(const Eigen::VectorXd &x, Eigen::VectorXd &grad_out,
+                        TimeCostFunc &&time_cost_func,
+                        IntegralCostFunc &&integral_cost_func,
+                        TrajectoryCostFunc &&trajectory_cost_func,
+                        SampleCostFunc &&sample_cost_func,
+                        Workspace *ws = nullptr,
+                        const Executor& executor = Executor()) const
+        {
+            return evaluate(x, grad_out,
+                            std::forward<TimeCostFunc>(time_cost_func),
+                            VoidWaypointsCost(),
+                            std::forward<IntegralCostFunc>(integral_cost_func),
+                            std::forward<TrajectoryCostFunc>(trajectory_cost_func),
+                            std::forward<SampleCostFunc>(sample_cost_func),
+                            ws,
+                            executor);
+        }
+
+        /**
+         * @brief Backward-compatible evaluate overload with no whole-spline cost.
          */
         template <typename TimeCostFunc, typename IntegralCostFunc, typename Executor = SerialExecutor>
         double evaluate(const Eigen::VectorXd &x, Eigen::VectorXd &grad_out,
                         TimeCostFunc &&time_cost_func,
                         IntegralCostFunc &&integral_cost_func,
-                        Workspace *ws = nullptr,
+                        Workspace *ws,
                         const Executor& executor = Executor()) const
         {
-            return evaluateWithSampleCostImpl(x, grad_out,
-                                              std::forward<TimeCostFunc>(time_cost_func),
-                                              VoidWaypointsCost(),
-                                              std::forward<IntegralCostFunc>(integral_cost_func),
-                                              VoidSampleCost(),
-                                              ws,
-                                              executor);
+            return evaluate(x, grad_out,
+                            std::forward<TimeCostFunc>(time_cost_func),
+                            std::forward<IntegralCostFunc>(integral_cost_func),
+                            VoidTrajectoryCost<SplineType, DIM>(),
+                            ws,
+                            executor);
         }
-
 
 
         const SplineType *getOptimalSpline() const
@@ -1191,7 +1591,7 @@ namespace SplineTrajectory
             Workspace& ws_ref = (ws != nullptr) ? *ws : *getOrCreateInternalWorkspace();
             
             res.analytical.resize(x.size());
-            evaluate(x, res.analytical, tf, wf, ifc, &ws_ref);
+            evaluate(x, res.analytical, tf, wf, ifc, VoidTrajectoryCost<SplineType, DIM>(), &ws_ref);
 
             res.numerical.resize(x.size());
             Eigen::VectorXd dummy_grad(x.size());
@@ -1203,17 +1603,17 @@ namespace SplineTrajectory
                 double old_val = x_temp(i);
                 
                 x_temp(i) = old_val + eps;
-                double c_p = evaluate(x_temp, dummy_grad, tf, wf, ifc, &ws_ref);
+                double c_p = evaluate(x_temp, dummy_grad, tf, wf, ifc, VoidTrajectoryCost<SplineType, DIM>(), &ws_ref);
                 
                 x_temp(i) = old_val - eps;
-                double c_m = evaluate(x_temp, dummy_grad, tf, wf, ifc, &ws_ref);
+                double c_m = evaluate(x_temp, dummy_grad, tf, wf, ifc, VoidTrajectoryCost<SplineType, DIM>(), &ws_ref);
                 
                 x_temp(i) = old_val;
 
                 res.numerical(i) = (c_p - c_m) / (2 * eps);
             }
 
-            evaluate(x, res.analytical, tf, wf, ifc, &ws_ref);
+            evaluate(x, res.analytical, tf, wf, ifc, VoidTrajectoryCost<SplineType, DIM>(), &ws_ref);
 
             Eigen::VectorXd diff = res.analytical - res.numerical;
             res.error_norm = diff.norm();
@@ -1326,12 +1726,14 @@ namespace SplineTrajectory
 
         template <typename IntegralFunc, typename Executor>
         void calculateIntegralCost(Workspace &ws, MatrixType &gdC, Eigen::VectorXd &gdT, double &cost,
-                                   IntegralFunc &&integral_cost, bool collect_samples,
+                                   IntegralFunc &&integral_cost,
+                                   double start_time,
+                                   bool collect_samples,
                                    const Executor& executor) const
         {
             const auto &coeffs = ws.spline.getTrajectory().getCoefficients();
 
-            double running_time = start_time_;
+            double running_time = start_time;
             for(int i = 0; i < num_segments_; ++i) {
                 ws.segment_start_times[i] = running_time;
                 running_time += ws.cache_times[i];
