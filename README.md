@@ -8,4 +8,25 @@ Please follow the [tutorial PDF file](swarm-playground/[README]_Brief_Documentat
 This work was born out of [MINCO](https://github.com/ZJU-FAST-Lab/GCOPTER).
 If you find it interesting, please give both repos stars generously. Thanks.
 
+## main_ws Build and Run
+
+Build:
+
+```bash
+cd /home/zdp/Codefield/EGO-Planner-v2/swarm-playground/main_ws
+catkin_make
+```
+
+Launch RViz:
+
+```bash
+roslaunch ego_planner rviz.launch
+```
+
+Launch circle exchange:
+
+```bash
+roslaunch ego_planner circle_exchange.launch
+```
+
 <img src="images/cover.jpg" alt="drawing" width="400"/>

@@ -1,49 +1,10 @@
 #include "optimizer/poly_traj_optimizer.h"
+#include "TrajectoryOptAdapters/EgoVarianceSampleCostAdapter.hpp"
 
 using namespace std;
 
 namespace ego_planner
 {
-  // =====================================================
-  //  Helpers for discrete variance gradient (same-iteration)
-  // =====================================================
-  struct ZeroTimeCostFunction
-  {
-    double operator()(const std::vector<double> &, Eigen::VectorXd &) const
-    {
-      return 0.0;
-    }
-  };
-
-  class VarianceGradCostFunction
-  {
-  public:
-    const Eigen::MatrixXd *variance_grad{nullptr};
-    const std::vector<double> *segment_dt{nullptr};
-    int cps_per_piece{1};
-
-    double operator()(double /*t*/, double /*t_global*/, int seg_idx, int step_in_seg,
-                      const Vec3 & /*p*/, const Vec3 & /*v*/,
-                      const Vec3 & /*a*/, const Vec3 & /*j*/, const Vec3 & /*s*/,
-                      Vec3 &gp, Vec3 & /*gv*/, Vec3 & /*ga*/,
-                      Vec3 & /*gj*/, Vec3 & /*gs*/, double & /*gt*/) const
-    {
-      int cp_idx = seg_idx * cps_per_piece + step_in_seg;
-      if (variance_grad && segment_dt &&
-          cp_idx < variance_grad->cols() &&
-          seg_idx >= 0 && seg_idx < (int)segment_dt->size())
-      {
-        double dt = (*segment_dt)[seg_idx];
-        if (dt > 1e-12)
-        {
-          gp += variance_grad->col(cp_idx) / dt;
-        }
-      }
-
-      return 0.0;
-    }
-  };
-
   // =====================================================
   //  Generate trajectory from states using QuinticSplineND
   // =====================================================
@@ -121,50 +82,17 @@ namespace ego_planner
     Eigen::VectorXd x_vec = Eigen::Map<const Eigen::VectorXd>(x, n);
     Eigen::VectorXd grad_vec = Eigen::VectorXd::Zero(n);
 
-    // Pre-compute segment dt for variance gradient scaling.
-    // x layout: [tau_0, ..., tau_{N-1}, P_inner, ...]
-    // T_i = QuadInvTimeMap::toTime(tau_i), dt_i = T_i / K
-    {
-      SplineTrajectory::QuadInvTimeMap time_map;
-      opt->integral_cost_func_.segment_dt_.resize(opt->piece_num_);
-      for (int i = 0; i < opt->piece_num_; ++i)
-      {
-        double T = time_map.toTime(x_vec(i));
-        opt->integral_cost_func_.segment_dt_[i] = T / opt->cps_num_prePiece_;
-      }
-    }
-
     opt->integral_cost_func_.resetAccumulation();
 
     double total_cost = opt->splineOpt_.evaluate(
         x_vec, grad_vec,
         opt->time_cost_func_,
-        opt->integral_cost_func_);
+        SplineTrajectory::VoidWaypointsCost(),
+        opt->integral_cost_func_,
+        opt->sample_cost_func_,
+        nullptr);
 
-    // Distance variance cost on constraint points (post-processing).
-    // Apply its gradient in the SAME iteration to keep L-BFGS consistent.
-    if (opt->wei_sqrvar_ > 0 && opt->cps_.cp_size > 1)
-    {
-      Eigen::MatrixXd gdp;
-      double var_cost_value = 0.0;
-      opt->distanceSqrVarianceWithGradCost2p(opt->cps_.points, gdp, var_cost_value);
-      total_cost += var_cost_value;
-
-      // Inject discrete variance gradient via a second pass (no time/energy cost).
-      VarianceGradCostFunction var_cost_func;
-      var_cost_func.variance_grad = &gdp;
-      var_cost_func.segment_dt = &opt->integral_cost_func_.segment_dt_;
-      var_cost_func.cps_per_piece = opt->cps_num_prePiece_;
-
-      Eigen::VectorXd grad_var = Eigen::VectorXd::Zero(n);
-      ZeroTimeCostFunction zero_time;
-      double rho_backup = opt->rho_energy_;
-      opt->splineOpt_.setEnergyWeights(0.0);
-      opt->splineOpt_.evaluate(x_vec, grad_var, zero_time, var_cost_func);
-      opt->splineOpt_.setEnergyWeights(rho_backup);
-
-      grad_vec += grad_var;
-    }
+    opt->updateConstraintPointsFromSamples();
 
     // Copy gradients back to raw pointer
     Eigen::Map<Eigen::VectorXd>(grad, n) = grad_vec;
@@ -177,6 +105,28 @@ namespace ego_planner
 
     opt->iter_num_ += 1;
     return total_cost;
+  }
+
+  void PolyTrajOptimizer::updateConstraintPointsFromSamples()
+  {
+    if (cps_.cp_size <= 0)
+    {
+      return;
+    }
+
+    if (cps_.points.rows() != 3 || cps_.points.cols() != cps_.cp_size)
+    {
+      cps_.points.resize(3, cps_.cp_size);
+    }
+
+    const auto &samples = splineOpt_.getIntegralSamples();
+    for (const auto &sample : samples)
+    {
+      if (sample.cp_idx >= 0 && sample.cp_idx < cps_.cp_size)
+      {
+        cps_.points.col(sample.cp_idx) = sample.p;
+      }
+    }
   }
 
   int PolyTrajOptimizer::earlyExitCallback(void *func_data, const double *x, const double *g, const double fx, const double xnorm, const double gnorm, const double step, int n, int k, int ls)
@@ -263,30 +213,6 @@ namespace ego_planner
     }
 
     return true;
-  }
-
-  // =====================================================
-  //  Distance variance cost on constraint points
-  // =====================================================
-  void PolyTrajOptimizer::distanceSqrVarianceWithGradCost2p(const Eigen::MatrixXd &ps,
-                                                            Eigen::MatrixXd &gdp,
-                                                            double &var)
-  {
-    int N = ps.cols() - 1;
-    Eigen::MatrixXd dps = ps.rightCols(N) - ps.leftCols(N);
-    Eigen::VectorXd dsqrs = dps.colwise().squaredNorm().transpose();
-    double dquarsum = dsqrs.squaredNorm();
-    double dquarmean = dquarsum / N;
-    var = wei_sqrvar_ * (dquarmean);
-    gdp.resize(3, N + 1);
-    gdp.setZero();
-    for (int i = 0; i <= N; i++)
-    {
-      if (i != 0)
-        gdp.col(i) += wei_sqrvar_ * (4.0 * (dsqrs(i - 1)) / N * dps.col(i - 1));
-      if (i != N)
-        gdp.col(i) += wei_sqrvar_ * (-4.0 * (dsqrs(i)) / N * dps.col(i));
-    }
   }
 
 } // namespace ego_planner

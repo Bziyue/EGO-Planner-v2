@@ -58,9 +58,6 @@ public:
 
     const int cp_idx = seg_idx * cps_per_piece + step_in_seg;
 
-    if (cps && cp_idx < cps->cp_size)
-      cps->points.col(cp_idx) = p;
-
     const double obstacle_cost = traj_opt_components::accumulateEgoObstaclePenalty(cp_idx,
                                                                                     cps,
                                                                                     touch_goal,

@@ -28,7 +28,7 @@ namespace ego_planner
   class ConstraintPoints
   {
   public:
-    int cp_size; // deformation points
+    int cp_size{0}; // deformation points
     Eigen::MatrixXd points;
     std::vector<std::vector<Eigen::Vector3d>> base_point;
     std::vector<std::vector<Eigen::Vector3d>> direction;

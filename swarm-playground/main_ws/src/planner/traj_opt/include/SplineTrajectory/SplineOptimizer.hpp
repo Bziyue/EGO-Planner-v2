@@ -368,6 +368,37 @@ namespace SplineTrajectory
         using VectorType = typename SplineType::VectorType;
         using MatrixType = typename SplineType::MatrixType;
         using WaypointsType = MatrixType;
+        using SampleGradMatrix = Eigen::Matrix<double, DIM, Eigen::Dynamic>;
+
+        struct IntegralSample
+        {
+            EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+            int seg_idx = 0;
+            int step_in_seg = 0;
+            int cp_idx = 0;
+            double alpha = 0.0;
+            double t_local = 0.0;
+            double t_global = 0.0;
+            double trap_weight = 0.0;
+            double dt = 0.0;
+            Eigen::Matrix<double, 1, SplineType::COEFF_NUM> b_p;
+            VectorType p = VectorType::Zero();
+            VectorType v = VectorType::Zero();
+        };
+
+        using IntegralSampleBuffer = std::vector<IntegralSample, Eigen::aligned_allocator<IntegralSample>>;
+
+        struct VoidSampleCost
+        {
+            template <typename SamplesType>
+            double operator()(const SamplesType & /*samples*/,
+                              SampleGradMatrix & /*grad_p*/,
+                              Eigen::VectorXd & /*grad_t_global*/) const
+            {
+                return 0.0;
+            }
+        };
 
         /**
          * @brief Workspace holds all mutable state required during optimization.
@@ -390,8 +421,12 @@ namespace SplineTrajectory
 
             Eigen::VectorXd explicit_time_grad_buffer;
             MatrixType discrete_grad_q_buffer;
+            SampleGradMatrix sample_grad_p_buffer;
+            Eigen::VectorXd sample_grad_t_buffer;
             std::vector<double> segment_start_times;
             std::vector<double> segment_costs;
+            IntegralSampleBuffer integral_samples;
+            bool collect_integral_samples = false;
 
             void resize(int num_segments)
             {
@@ -404,8 +439,11 @@ namespace SplineTrajectory
                     cache_gdC.resize(num_segments * SplineType::COEFF_NUM, DIM);
                     explicit_time_grad_buffer.resize(num_segments);
                     discrete_grad_q_buffer.resize(num_segments + 1, DIM);
+                    sample_grad_p_buffer.resize(DIM, 0);
+                    sample_grad_t_buffer.resize(0);
                     segment_start_times.resize(num_segments);
                     segment_costs.resize(num_segments);
+                    integral_samples.clear();
                 }
             }
         };
@@ -695,6 +733,16 @@ namespace SplineTrajectory
         }
         void setEnergyWeights(double rho_energy) { rho_energy_ = rho_energy; }
         void setIntegralNumSteps(int steps) { integral_num_steps_ = steps; }
+        void setCollectIntegralSamples(bool enable, Workspace *ws = nullptr) const
+        {
+            Workspace& ws_ref = (ws != nullptr) ? *ws : *getOrCreateInternalWorkspace();
+            ws_ref.collect_integral_samples = enable;
+        }
+        const IntegralSampleBuffer &getIntegralSamples(Workspace *ws = nullptr) const
+        {
+            Workspace& ws_ref = (ws != nullptr) ? *ws : *getOrCreateInternalWorkspace();
+            return ws_ref.integral_samples;
+        }
 
         /**
          * @brief Check if the current optimization state is valid.
@@ -837,22 +885,22 @@ namespace SplineTrajectory
         }
 
         /**
-         * @brief Primary evaluate: 3 cost functions with optional Workspace and Executor.
-         * @param ws Workspace pointer (default nullptr to use internal workspace).
-         * @param executor Executor instance (default SerialExecutor).
+         * @brief Internal evaluate implementation that also supports discrete sample-space costs.
          */
-        template <typename TimeCostFunc, typename WaypointsCostFunc, typename IntegralCostFunc, 
-                  typename Executor = SerialExecutor>
-        double evaluate(const Eigen::VectorXd &x, Eigen::VectorXd &grad_out,
-                        TimeCostFunc &&time_cost_func,
-                        WaypointsCostFunc &&waypoints_cost_func,
-                        IntegralCostFunc &&integral_cost_func,
-                        Workspace *ws = nullptr,
-                        const Executor& executor = Executor()) const
+        template <typename TimeCostFunc, typename WaypointsCostFunc, typename IntegralCostFunc,
+                  typename SampleCostFunc, typename Executor = SerialExecutor>
+        double evaluateWithSampleCostImpl(const Eigen::VectorXd &x, Eigen::VectorXd &grad_out,
+                                          TimeCostFunc &&time_cost_func,
+                                          WaypointsCostFunc &&waypoints_cost_func,
+                                          IntegralCostFunc &&integral_cost_func,
+                                          SampleCostFunc &&sample_cost_func,
+                                          Workspace *ws,
+                                          const Executor& executor = Executor()) const
         {
             using TCF = typename std::decay<TimeCostFunc>::type;
             using WCF = typename std::decay<WaypointsCostFunc>::type;
-            using SCF = typename std::decay<IntegralCostFunc>::type;
+            using ICF = typename std::decay<IntegralCostFunc>::type;
+            using SampleCF = typename std::decay<SampleCostFunc>::type;
             constexpr bool kSupportsMatrixWaypointsCost =
                 TypeTraits::HasWaypointsCostInterface<WCF, WaypointsType>::value;
 
@@ -864,7 +912,7 @@ namespace SplineTrajectory
                           "\n[SplineOptimizer Error] 'WaypointsCostFunc' signature mismatch.\n"
                           "Required: double operator()(const MatrixType& qs, MatrixXd &grad_q)\n");
 
-            static_assert(TypeTraits::HasIntegralCostInterface<SCF, VectorType>::value,
+            static_assert(TypeTraits::HasIntegralCostInterface<ICF, VectorType>::value,
                           "\n[SplineOptimizer Error] 'IntegralCostFunc' signature mismatch.\n");
 
             static_assert(TypeTraits::HasExecutorInterface<Executor>::value,
@@ -895,11 +943,10 @@ namespace SplineTrajectory
             BoundaryConditions<DIM> current_bc = ref_bc_;
             int offset = derivatives_offset_;
             auto apply_derivatives_forward = [&](auto&& op) {
-
                 if (flags_.start_v) op(current_bc.start_velocity);
                 if constexpr (SplineType::ORDER >= 5) if (flags_.start_a) op(current_bc.start_acceleration);
                 if constexpr (SplineType::ORDER >= 7) if (flags_.start_j) op(current_bc.start_jerk);
-                
+
                 if (flags_.end_v) op(current_bc.end_velocity);
                 if constexpr (SplineType::ORDER >= 5) if (flags_.end_a) op(current_bc.end_acceleration);
                 if constexpr (SplineType::ORDER >= 7) if (flags_.end_j) op(current_bc.end_jerk);
@@ -918,9 +965,35 @@ namespace SplineTrajectory
             ws_ref.cache_gdT += ws_ref.user_gdT_buffer;
 
             ws_ref.cache_gdC.setZero();
-            calculateIntegralCost(ws_ref, ws_ref.cache_gdC, ws_ref.cache_gdT, total_cost, 
+            const bool need_samples =
+                ws_ref.collect_integral_samples || !std::is_same_v<SampleCF, VoidSampleCost>;
+
+            calculateIntegralCost(ws_ref, ws_ref.cache_gdC, ws_ref.cache_gdT, total_cost,
                                   std::forward<IntegralCostFunc>(integral_cost_func),
+                                  need_samples,
                                   executor);
+
+            if constexpr (!std::is_same_v<SampleCF, VoidSampleCost>)
+            {
+                const Eigen::Index sample_count =
+                    static_cast<Eigen::Index>(ws_ref.integral_samples.size());
+
+                ws_ref.sample_grad_p_buffer.resize(DIM, sample_count);
+                ws_ref.sample_grad_p_buffer.setZero();
+                ws_ref.sample_grad_t_buffer.resize(sample_count);
+                ws_ref.sample_grad_t_buffer.setZero();
+
+                double sample_cost = sample_cost_func(ws_ref.integral_samples,
+                                                      ws_ref.sample_grad_p_buffer,
+                                                      ws_ref.sample_grad_t_buffer);
+                total_cost += sample_cost;
+
+                accumulateSampleGradients(ws_ref.integral_samples,
+                                          ws_ref.sample_grad_p_buffer,
+                                          ws_ref.sample_grad_t_buffer,
+                                          ws_ref.cache_gdC,
+                                          ws_ref.cache_gdT);
+            }
 
             ws_ref.spline.propagateGrad(ws_ref.cache_gdC, ws_ref.cache_gdT, ws_ref.grads);
 
@@ -932,7 +1005,8 @@ namespace SplineTrajectory
                 total_cost += dw_cost;
 
                 ws_ref.grads.start.p += ws_ref.discrete_grad_q_buffer.row(0).transpose();
-                if (n_inner > 0) {
+                if (n_inner > 0)
+                {
                     ws_ref.grads.inner_points += ws_ref.discrete_grad_q_buffer.block(1, 0, n_inner, DIM);
                 }
                 ws_ref.grads.end.p += ws_ref.discrete_grad_q_buffer.row(num_segments_).transpose();
@@ -960,7 +1034,6 @@ namespace SplineTrajectory
                 if constexpr (SplineType::ORDER >= 7) ws_ref.grads.end.j += rho_energy_ * ws_ref.energy_grads.end.j;
             }
 
-            // Time gradient: backward through time map
             for (int i = 0; i < num_segments_; ++i)
             {
                 double tau = x(i);
@@ -969,7 +1042,6 @@ namespace SplineTrajectory
                 grad_out(i) = active_time_map_->backward(tau, T, gradT);
             }
 
-            // Spatial gradient: unified loop with backward mapping
             for (const auto &var : spatial_layout_)
             {
                 const auto xi = x.segment(var.offset, var.dof);
@@ -997,7 +1069,7 @@ namespace SplineTrajectory
                 if (flags_.start_v) op(ws_ref.grads.start.v);
                 if constexpr (SplineType::ORDER >= 5) if (flags_.start_a) op(ws_ref.grads.start.a);
                 if constexpr (SplineType::ORDER >= 7) if (flags_.start_j) op(ws_ref.grads.start.j);
-                
+
                 if (flags_.end_v) op(ws_ref.grads.end.v);
                 if constexpr (SplineType::ORDER >= 5) if (flags_.end_a) op(ws_ref.grads.end.a);
                 if constexpr (SplineType::ORDER >= 7) if (flags_.end_j) op(ws_ref.grads.end.j);
@@ -1012,21 +1084,68 @@ namespace SplineTrajectory
         }
 
         /**
-         * @brief Secondary evaluate: 2 cost functions (no waypoints cost).
-         * Forwards to primary evaluate with VoidWaypointsCost.
+         * @brief Evaluate with an additional sample-space cost.
+         * The workspace argument is explicit to avoid ambiguity with the legacy evaluate overloads.
          */
-        template <typename TimeCostFunc, typename IntegralCostFunc, typename Executor = SerialExecutor>
+        template <typename TimeCostFunc, typename WaypointsCostFunc, typename IntegralCostFunc,
+                  typename SampleCostFunc, typename Executor = SerialExecutor>
         double evaluate(const Eigen::VectorXd &x, Eigen::VectorXd &grad_out,
-                        TimeCostFunc &&time_cost_func, 
+                        TimeCostFunc &&time_cost_func,
+                        WaypointsCostFunc &&waypoints_cost_func,
+                        IntegralCostFunc &&integral_cost_func,
+                        SampleCostFunc &&sample_cost_func,
+                        Workspace *ws,
+                        const Executor& executor = Executor()) const
+        {
+            return evaluateWithSampleCostImpl(x, grad_out,
+                                              std::forward<TimeCostFunc>(time_cost_func),
+                                              std::forward<WaypointsCostFunc>(waypoints_cost_func),
+                                              std::forward<IntegralCostFunc>(integral_cost_func),
+                                              std::forward<SampleCostFunc>(sample_cost_func),
+                                              ws,
+                                              executor);
+        }
+
+        /**
+         * @brief Primary evaluate: 3 cost functions with optional Workspace and Executor.
+         * Preserves the original API and forwards to the sample-aware implementation.
+         */
+        template <typename TimeCostFunc, typename WaypointsCostFunc, typename IntegralCostFunc,
+                  typename Executor = SerialExecutor>
+        double evaluate(const Eigen::VectorXd &x, Eigen::VectorXd &grad_out,
+                        TimeCostFunc &&time_cost_func,
+                        WaypointsCostFunc &&waypoints_cost_func,
                         IntegralCostFunc &&integral_cost_func,
                         Workspace *ws = nullptr,
                         const Executor& executor = Executor()) const
         {
-            return evaluate(x, grad_out,
-                            std::forward<TimeCostFunc>(time_cost_func),
-                            VoidWaypointsCost(), 
-                            std::forward<IntegralCostFunc>(integral_cost_func),
-                            ws, executor);
+            return evaluateWithSampleCostImpl(x, grad_out,
+                                              std::forward<TimeCostFunc>(time_cost_func),
+                                              std::forward<WaypointsCostFunc>(waypoints_cost_func),
+                                              std::forward<IntegralCostFunc>(integral_cost_func),
+                                              VoidSampleCost(),
+                                              ws,
+                                              executor);
+        }
+
+        /**
+         * @brief Secondary evaluate: 2 cost functions (no waypoints cost).
+         * Forwards to primary evaluate with VoidWaypointsCost and VoidSampleCost.
+         */
+        template <typename TimeCostFunc, typename IntegralCostFunc, typename Executor = SerialExecutor>
+        double evaluate(const Eigen::VectorXd &x, Eigen::VectorXd &grad_out,
+                        TimeCostFunc &&time_cost_func,
+                        IntegralCostFunc &&integral_cost_func,
+                        Workspace *ws = nullptr,
+                        const Executor& executor = Executor()) const
+        {
+            return evaluateWithSampleCostImpl(x, grad_out,
+                                              std::forward<TimeCostFunc>(time_cost_func),
+                                              VoidWaypointsCost(),
+                                              std::forward<IntegralCostFunc>(integral_cost_func),
+                                              VoidSampleCost(),
+                                              ws,
+                                              executor);
         }
 
 
@@ -1160,12 +1279,58 @@ namespace SplineTrajectory
             return total_dimension_;
         }
 
+        void accumulateSampleGradients(const IntegralSampleBuffer &samples,
+                                       const SampleGradMatrix &grad_p,
+                                       const Eigen::VectorXd &grad_t_global,
+                                       MatrixType &gdC,
+                                       Eigen::VectorXd &gdT) const
+        {
+            const Eigen::Index sample_count = static_cast<Eigen::Index>(samples.size());
+            if (sample_count == 0)
+            {
+                return;
+            }
+
+            if (grad_p.rows() != DIM || grad_p.cols() != sample_count)
+            {
+                return;
+            }
+
+            Eigen::VectorXd explicit_time_grad = Eigen::VectorXd::Zero(num_segments_);
+
+            for (Eigen::Index sample_idx = 0; sample_idx < sample_count; ++sample_idx)
+            {
+                const IntegralSample &sample = samples[sample_idx];
+                const int base_row = sample.seg_idx * SplineType::COEFF_NUM;
+                const VectorType gp = grad_p.col(sample_idx);
+
+                gdC.template block<SplineType::COEFF_NUM, DIM>(base_row, 0).noalias() +=
+                    sample.b_p.transpose() * gp.transpose();
+                gdT(sample.seg_idx) += gp.dot(sample.v) * sample.alpha;
+
+                if (sample_idx < grad_t_global.size())
+                {
+                    const double gt = grad_t_global(sample_idx);
+                    gdT(sample.seg_idx) += gt * sample.alpha;
+                    explicit_time_grad(sample.seg_idx) += gt;
+                }
+            }
+
+            double accumulator = 0.0;
+            for (int i = num_segments_ - 1; i > 0; --i)
+            {
+                accumulator += explicit_time_grad(i);
+                gdT(i - 1) += accumulator;
+            }
+        }
+
         template <typename IntegralFunc, typename Executor>
-        void calculateIntegralCost(Workspace &ws, MatrixType &gdC, Eigen::VectorXd &gdT, double &cost, 
-                                   IntegralFunc &&integral_cost, const Executor& executor) const
+        void calculateIntegralCost(Workspace &ws, MatrixType &gdC, Eigen::VectorXd &gdT, double &cost,
+                                   IntegralFunc &&integral_cost, bool collect_samples,
+                                   const Executor& executor) const
         {
             const auto &coeffs = ws.spline.getTrajectory().getCoefficients();
-            
+
             double running_time = start_time_;
             for(int i = 0; i < num_segments_; ++i) {
                 ws.segment_start_times[i] = running_time;
@@ -1178,15 +1343,24 @@ namespace SplineTrajectory
 
             int K = integral_num_steps_;
             double inv_K = 1.0 / K;
-            
+
+            if (collect_samples)
+            {
+                ws.integral_samples.resize(num_segments_ * (K + 1));
+            }
+            else
+            {
+                ws.integral_samples.clear();
+            }
+
             executor(0, num_segments_, [&](int i) {
                 double T = ws.cache_times[i];
                 double dt = T * inv_K;
                 int base_row = i * SplineType::COEFF_NUM;
-                
-                Eigen::Matrix<double, SplineType::COEFF_NUM, DIM> coeff_block = 
-                     coeffs.template block<SplineType::COEFF_NUM, DIM>(base_row, 0); 
-                
+
+                Eigen::Matrix<double, SplineType::COEFF_NUM, DIM> coeff_block =
+                     coeffs.template block<SplineType::COEFF_NUM, DIM>(base_row, 0);
+
                 double local_acc_cost = 0.0;
                 double local_acc_gdT = 0.0;
                 double local_acc_explicit_time_grad = 0.0;
@@ -1208,7 +1382,7 @@ namespace SplineTrajectory
                     double t_global = current_segment_start_time + t;
 
                     SplineType::computeBasisFunctions(t, b_p, b_v, b_a, b_j, b_s, b_c);
-                    
+
                     VectorType p, v, a, j, s, c;
                     p.transpose().noalias() = b_p * coeff_block;
                     v.transpose().noalias() = b_v * coeff_block;
@@ -1226,13 +1400,30 @@ namespace SplineTrajectory
 
                     double c_val = integral_cost(t, t_global, i, k, p, v, a, j, s, gp, gv, ga, gj, gs, gt);
 
+                    if (collect_samples)
+                    {
+                        const int sample_index = i * (K + 1) + k;
+                        IntegralSample &sample = ws.integral_samples[sample_index];
+                        sample.seg_idx = i;
+                        sample.step_in_seg = k;
+                        sample.cp_idx = i * K + k;
+                        sample.alpha = alpha;
+                        sample.t_local = t;
+                        sample.t_global = t_global;
+                        sample.trap_weight = weight_trap;
+                        sample.dt = dt;
+                        sample.b_p = b_p;
+                        sample.p = p;
+                        sample.v = v;
+                    }
+
                     local_acc_cost += c_val * common_weight;
 
                     local_acc_gdC.noalias() += (
-                        b_p.transpose() * gp.transpose() + 
-                        b_v.transpose() * gv.transpose() + 
-                        b_a.transpose() * ga.transpose() + 
-                        b_j.transpose() * gj.transpose() + 
+                        b_p.transpose() * gp.transpose() +
+                        b_v.transpose() * gv.transpose() +
+                        b_a.transpose() * ga.transpose() +
+                        b_j.transpose() * gj.transpose() +
                         b_s.transpose() * gs.transpose()
                     ) * common_weight;
 
@@ -1246,10 +1437,10 @@ namespace SplineTrajectory
                 }
 
                 ws.segment_costs[i] = local_acc_cost;
-                
+
                 gdT(i) += local_acc_gdT;
                 ws.explicit_time_grad_buffer(i) += local_acc_explicit_time_grad;
-                
+
                 gdC.template block(base_row, 0, SplineType::COEFF_NUM, DIM) += local_acc_gdC;
             });
 

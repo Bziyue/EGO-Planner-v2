@@ -62,6 +62,7 @@ namespace ego_planner
     splineOpt_.setOptimizationFlags(flags);
     splineOpt_.setEnergyWeights(rho_energy_);
     splineOpt_.setIntegralNumSteps(cps_num_prePiece_);
+    splineOpt_.setCollectIntegralSamples(true);
 
     // Generate initial guess
     Eigen::VectorXd x0 = splineOpt_.generateInitialGuess();
@@ -95,6 +96,9 @@ namespace ego_planner
     integral_cost_func_.touch_goal = touch_goal_;
     integral_cost_func_.cps_per_piece = cps_num_prePiece_;
     integral_cost_func_.min_ellip_dist2_ptr = &min_ellip_dist2_;
+
+    sample_cost_func_.cps = &cps_;
+    sample_cost_func_.weight = wei_sqrvar_;
 
     // LBFGS params
     lbfgs::lbfgs_parameter_t lbfgs_params;
@@ -1028,6 +1032,7 @@ namespace ego_planner
 
   void PolyTrajOptimizer::setControlPoints(const Eigen::MatrixXd &points)
   {
+    cps_.cp_size = points.cols();
     cps_.points = points;
   }
 

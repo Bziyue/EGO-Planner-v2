@@ -60,6 +60,7 @@ namespace ego_planner
     // Cost function instances
     TimeCostFunction time_cost_func_;
     IntegralCostFunction integral_cost_func_;
+    SampleCostFunction sample_cost_func_;
 
   public:
     PolyTrajOptimizer() {}
@@ -110,13 +111,6 @@ namespace ego_planner
      */
     bool computePointsToCheck(const PPoly3D &traj, int id_end, PtsChk_t &pts_check);
 
-    /**
-     * @brief Distance variance cost on constraint points.
-     */
-    void distanceSqrVarianceWithGradCost2p(const Eigen::MatrixXd &ps,
-                                           Eigen::MatrixXd &gdp,
-                                           double &var);
-
     // --- Decision logic (implemented in poly_traj_optimizer.cpp) ---
 
     /** @brief Main optimization loop with retry/rebound control. */
@@ -140,6 +134,8 @@ namespace ego_planner
     std::vector<ConstraintPoints> distinctiveTrajs(std::vector<std::pair<int, int>> segments);
 
   private:
+    void updateConstraintPointsFromSamples();
+
     /* callbacks by the L-BFGS optimizer (in traj_numerics.cpp) */
     static double costFunctionCallback(void *func_data, const double *x, double *grad, const int n);
 
