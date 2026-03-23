@@ -12,6 +12,7 @@ public:
   using SampleGradMatrix = ego_planner::SplineOpt::SampleGradMatrix;
 
   const Types::ConstraintPoints *cps{nullptr};
+  int cps_per_piece{0};
   double weight{0.0};
 
   static void distanceSqrVarianceWithGradCost2p(const Eigen::MatrixXd &ps,
@@ -64,9 +65,10 @@ public:
     sampled_points.setZero();
     for (const auto &sample : samples)
     {
-      if (sample.cp_idx >= 0 && sample.cp_idx < cps->cp_size)
+      const int control_point_index = sample.seg_idx * cps_per_piece + sample.step_in_seg;
+      if (control_point_index >= 0 && control_point_index < cps->cp_size)
       {
-        sampled_points.col(sample.cp_idx) = sample.p;
+        sampled_points.col(control_point_index) = sample.p;
       }
     }
 
@@ -77,9 +79,10 @@ public:
     for (Eigen::Index sample_idx = 0; sample_idx < static_cast<Eigen::Index>(samples.size()); ++sample_idx)
     {
       const auto &sample = samples[sample_idx];
-      if (sample.cp_idx >= 0 && sample.cp_idx < gdp.cols())
+      const int control_point_index = sample.seg_idx * cps_per_piece + sample.step_in_seg;
+      if (control_point_index >= 0 && control_point_index < gdp.cols())
       {
-        grad_p.col(sample_idx) = sample.trap_weight * gdp.col(sample.cp_idx);
+        grad_p.col(sample_idx) = sample.trap_weight * gdp.col(control_point_index);
       }
     }
 

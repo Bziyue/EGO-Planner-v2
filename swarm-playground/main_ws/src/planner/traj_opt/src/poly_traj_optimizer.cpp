@@ -49,7 +49,12 @@ namespace ego_planner
     for (int i = 0; i < piece_num_; ++i)
       time_segs[i] = initT(i);
 
-    splineOpt_.setInitState(time_segs, waypoints, 0.0, bc);
+    const auto init_status = splineOpt_.setInitState(time_segs, waypoints, 0.0, bc);
+    if (!init_status)
+    {
+      ROS_ERROR_STREAM("SplineOptimizer init failed: " << init_status.message);
+      return false;
+    }
 
     // Only optimize inner waypoints and times, fix boundary states
     SplineTrajectory::OptimizationFlags flags;
@@ -61,8 +66,13 @@ namespace ego_planner
     flags.end_a = false;
     splineOpt_.setOptimizationFlags(flags);
     splineOpt_.setEnergyWeights(rho_energy_);
-    splineOpt_.setIntegralNumSteps(cps_num_prePiece_);
-    splineOpt_.setCollectIntegralSamples(true);
+    const auto integral_step_status = splineOpt_.setIntegralNumSteps(cps_num_prePiece_);
+    if (!integral_step_status)
+    {
+      ROS_ERROR_STREAM("SplineOptimizer step setup failed: " << integral_step_status.message);
+      return false;
+    }
+    splineOpt_.setRecordIntegralSamples(true, spline_workspace_);
 
     // Generate initial guess
     Eigen::VectorXd x0 = splineOpt_.generateInitialGuess();
@@ -98,6 +108,7 @@ namespace ego_planner
     integral_cost_func_.min_ellip_dist2_ptr = &min_ellip_dist2_;
 
     sample_cost_func_.cps = &cps_;
+    sample_cost_func_.cps_per_piece = cps_num_prePiece_;
     sample_cost_func_.weight = wei_sqrvar_;
 
     // LBFGS params
@@ -155,27 +166,24 @@ namespace ego_planner
         if (!flag_swarm_too_close)
         {
           // Get optimized trajectory for collision check
-          const SplineTraj *opt_spline = splineOpt_.getOptimalSpline();
-          if (opt_spline)
+          const SplineTraj &opt_spline = splineOpt_.getWorkingSpline(spline_workspace_);
+          PPoly3D traj = opt_spline.getTrajectoryCopy();
+          Eigen::VectorXd durs(piece_num_);
+          for (int i = 0; i < piece_num_; ++i)
+            durs(i) = (*(opt_spline.getTrajectory().begin() + i)).duration();
+
+          Eigen::MatrixXd init_points = getInitConstraintPoints(traj, durs, cps_num_prePiece_);
+
+          if (finelyCheckAndSetConstraintPoints(segments_nouse, traj, init_points, false) == CHK_RET::OBS_FREE)
           {
-            PPoly3D traj = opt_spline->getTrajectoryCopy();
-            Eigen::VectorXd durs(piece_num_);
-            for (int i = 0; i < piece_num_; ++i)
-              durs(i) = (*(opt_spline->getTrajectory().begin() + i)).duration();
-
-            Eigen::MatrixXd init_points = getInitConstraintPoints(traj, durs, cps_num_prePiece_);
-
-            if (finelyCheckAndSetConstraintPoints(segments_nouse, traj, init_points, false) == CHK_RET::OBS_FREE)
-            {
-              flag_success = true;
-              PRINTF_COND("\033[32miter=%d,time(ms)=%5.3f,total_t(ms)=%5.3f,cost=%5.3f\n\033[0m", iter_num_, time_ms, total_time_ms, final_cost);
-            }
-            else
-            {
-              flag_still_unsafe = true;
-              restart_nums++;
-              PRINTF_COND("\033[32miter=%d,time(ms)=%5.3f, fine check collided, keep optimizing\n\033[0m", iter_num_, time_ms);
-            }
+            flag_success = true;
+            PRINTF_COND("\033[32miter=%d,time(ms)=%5.3f,total_t(ms)=%5.3f,cost=%5.3f\n\033[0m", iter_num_, time_ms, total_time_ms, final_cost);
+          }
+          else
+          {
+            flag_still_unsafe = true;
+            restart_nums++;
+            PRINTF_COND("\033[32miter=%d,time(ms)=%5.3f, fine check collided, keep optimizing\n\033[0m", iter_num_, time_ms);
           }
         }
         else

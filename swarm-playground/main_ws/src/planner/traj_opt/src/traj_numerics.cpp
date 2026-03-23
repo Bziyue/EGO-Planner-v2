@@ -5,6 +5,21 @@ using namespace std;
 
 namespace ego_planner
 {
+  SplineOpt::EvaluationResult PolyTrajOptimizer::evaluateCurrentDecisionVariables(
+      const Eigen::VectorXd &x,
+      Eigen::VectorXd &grad)
+  {
+    SplineOpt::EvaluateSpec<TimeCostFunction,
+                            IntegralCostFunction,
+                            SplineTrajectory::VoidWaypointsCost,
+                            SampleCostFunction> spec;
+    spec.time_cost = &time_cost_func_;
+    spec.integral_cost = &integral_cost_func_;
+    spec.sample_cost = &sample_cost_func_;
+    spec.workspace = &spline_workspace_;
+    return splineOpt_.evaluate(x, grad, spec);
+  }
+
   // =====================================================
   //  Generate trajectory from states using QuinticSplineND
   // =====================================================
@@ -84,13 +99,16 @@ namespace ego_planner
 
     opt->integral_cost_func_.resetAccumulation();
 
-    double total_cost = opt->splineOpt_.evaluate(
-        x_vec, grad_vec,
-        opt->time_cost_func_,
-        SplineTrajectory::VoidWaypointsCost(),
-        opt->integral_cost_func_,
-        opt->sample_cost_func_,
-        nullptr);
+    const auto eval_result = opt->evaluateCurrentDecisionVariables(x_vec, grad_vec);
+    if (!eval_result)
+    {
+      ROS_ERROR_STREAM("SplineOptimizer evaluate failed: " << eval_result.message);
+      opt->force_stop_type_ = STOP_FOR_ERROR;
+      Eigen::Map<Eigen::VectorXd>(grad, n).setZero();
+      return std::numeric_limits<double>::infinity();
+    }
+
+    const double total_cost = eval_result.cost;
 
     opt->updateConstraintPointsFromSamples();
 
@@ -119,12 +137,13 @@ namespace ego_planner
       cps_.points.resize(3, cps_.cp_size);
     }
 
-    const auto &samples = splineOpt_.getIntegralSamples();
+    const auto &samples = splineOpt_.getRecordedIntegralSamples(spline_workspace_);
     for (const auto &sample : samples)
     {
-      if (sample.cp_idx >= 0 && sample.cp_idx < cps_.cp_size)
+      const int control_point_index = sample.seg_idx * cps_num_prePiece_ + sample.step_in_seg;
+      if (control_point_index >= 0 && control_point_index < cps_.cp_size)
       {
-        cps_.points.col(sample.cp_idx) = sample.p;
+        cps_.points.col(control_point_index) = sample.p;
       }
     }
   }

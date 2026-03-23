@@ -21,6 +21,7 @@ namespace ego_planner
 
     // SplineOptimizer replaces MinJerkOpt
     SplineOpt splineOpt_;
+    SplineOpt::Workspace spline_workspace_;
 
     SwarmTrajData *swarm_trajs_{NULL};
     ConstraintPoints cps_;
@@ -86,6 +87,7 @@ namespace ego_planner
     /* helper functions */
     inline const ConstraintPoints &getControlPoints(void) { return cps_; }
     inline const SplineOpt &getSplineOpt(void) const { return splineOpt_; }
+    inline const SplineTraj &getWorkingSpline(void) const { return splineOpt_.getWorkingSpline(spline_workspace_); }
     inline int get_cps_num_prePiece_(void) { return cps_num_prePiece_; }
     inline double get_swarm_clearance_(void) { return swarm_clearance_; }
 
@@ -134,6 +136,8 @@ namespace ego_planner
     std::vector<ConstraintPoints> distinctiveTrajs(std::vector<std::pair<int, int>> segments);
 
   private:
+    SplineOpt::EvaluationResult evaluateCurrentDecisionVariables(const Eigen::VectorXd &x,
+                                                                Eigen::VectorXd &grad);
     void updateConstraintPointsFromSamples();
 
     /* callbacks by the L-BFGS optimizer (in traj_numerics.cpp) */

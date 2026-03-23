@@ -153,27 +153,21 @@ namespace ego_planner
           if (final_cost < min_cost)
           {
             min_cost = final_cost;
-            const SplineTraj *opt_spline = ploy_traj_opt_->getSplineOpt().getOptimalSpline();
-            if (opt_spline)
-            {
-              best_traj = opt_spline->getTrajectoryCopy();
-              best_durations = getDurationsFromTraj(best_traj);
-            }
+            const SplineTraj &opt_spline = ploy_traj_opt_->getWorkingSpline();
+            best_traj = opt_spline.getTrajectoryCopy();
+            best_durations = getDurationsFromTraj(best_traj);
             flag_success = true;
           }
 
           // visualization
-          const SplineTraj *vis_spline = ploy_traj_opt_->getSplineOpt().getOptimalSpline();
-          if (vis_spline)
-          {
-            PPoly3D vis_traj = vis_spline->getTrajectoryCopy();
-            Eigen::VectorXd vis_durs = getDurationsFromTraj(vis_traj);
-            Eigen::MatrixXd ctrl_pts_temp = ploy_traj_opt_->getInitConstraintPoints(vis_traj, vis_durs, ploy_traj_opt_->get_cps_num_prePiece_());
-            std::vector<Eigen::Vector3d> vis_pts;
-            for (int j = 0; j < ctrl_pts_temp.cols(); j++)
-              vis_pts.push_back(ctrl_pts_temp.col(j));
-            vis_trajs.push_back(vis_pts);
-          }
+          const SplineTraj &vis_spline = ploy_traj_opt_->getWorkingSpline();
+          PPoly3D vis_traj = vis_spline.getTrajectoryCopy();
+          Eigen::VectorXd vis_durs = getDurationsFromTraj(vis_traj);
+          Eigen::MatrixXd ctrl_pts_temp = ploy_traj_opt_->getInitConstraintPoints(vis_traj, vis_durs, ploy_traj_opt_->get_cps_num_prePiece_());
+          std::vector<Eigen::Vector3d> vis_pts;
+          for (int j = 0; j < ctrl_pts_temp.cols(); j++)
+            vis_pts.push_back(ctrl_pts_temp.col(j));
+          vis_trajs.push_back(vis_pts);
         }
       }
 
@@ -205,16 +199,12 @@ namespace ego_planner
 
       if (flag_success)
       {
-        const SplineTraj *opt_spline = ploy_traj_opt_->getSplineOpt().getOptimalSpline();
-        if (opt_spline)
-        {
-          PPoly3D opt_traj = opt_spline->getTrajectoryCopy();
-          Eigen::VectorXd opt_durs = getDurationsFromTraj(opt_traj);
-          setLocalTrajFromOpt(opt_traj, opt_durs, touch_goal);
-          cstr_pts = ploy_traj_opt_->getInitConstraintPoints(opt_traj, opt_durs, ploy_traj_opt_->get_cps_num_prePiece_());
-          visualization_->displayOptimalList(cstr_pts, 0);
-
-        }
+        const SplineTraj &opt_spline = ploy_traj_opt_->getWorkingSpline();
+        PPoly3D opt_traj = opt_spline.getTrajectoryCopy();
+        Eigen::VectorXd opt_durs = getDurationsFromTraj(opt_traj);
+        setLocalTrajFromOpt(opt_traj, opt_durs, touch_goal);
+        cstr_pts = ploy_traj_opt_->getInitConstraintPoints(opt_traj, opt_durs, ploy_traj_opt_->get_cps_num_prePiece_());
+        visualization_->displayOptimalList(cstr_pts, 0);
       }
     }
 
@@ -233,14 +223,11 @@ namespace ego_planner
     }
     else
     {
-      const SplineTraj *fail_spline = ploy_traj_opt_->getSplineOpt().getOptimalSpline();
-      if (fail_spline)
-      {
-        PPoly3D fail_traj = fail_spline->getTrajectoryCopy();
-        Eigen::VectorXd fail_durs = getDurationsFromTraj(fail_traj);
-        cstr_pts = ploy_traj_opt_->getInitConstraintPoints(fail_traj, fail_durs, ploy_traj_opt_->get_cps_num_prePiece_());
-        visualization_->displayFailedList(cstr_pts, 0);
-      }
+      const SplineTraj &fail_spline = ploy_traj_opt_->getWorkingSpline();
+      PPoly3D fail_traj = fail_spline.getTrajectoryCopy();
+      Eigen::VectorXd fail_durs = getDurationsFromTraj(fail_traj);
+      cstr_pts = ploy_traj_opt_->getInitConstraintPoints(fail_traj, fail_durs, ploy_traj_opt_->get_cps_num_prePiece_());
+      visualization_->displayFailedList(cstr_pts, 0);
 
       continous_failures_count_++;
     }
