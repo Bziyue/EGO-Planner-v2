@@ -49,33 +49,33 @@ namespace ego_planner
     for (int i = 0; i < piece_num_; ++i)
       time_segs[i] = initT(i);
 
-    const auto init_status = splineOpt_.setInitState(time_segs, waypoints, 0.0, bc);
+    SplineOpt::OptimizerConfig config;
+    config.rho_energy = rho_energy_;
+    config.integral_num_steps = cps_num_prePiece_;
+    const auto config_status = splineOpt_.setConfig(config);
+    if (!config_status)
+    {
+      ROS_ERROR_STREAM("SplineOptimizer config failed: " << config_status.message);
+      return false;
+    }
+
+    SplineOpt::ProblemDefinition problem;
+    problem.time_segments = time_segs;
+    problem.waypoints = waypoints;
+    problem.start_time = 0.0;
+    problem.bc = bc;
+
+    const auto init_status = splineOpt_.prepareContext(problem, spline_context_);
     if (!init_status)
     {
       ROS_ERROR_STREAM("SplineOptimizer init failed: " << init_status.message);
       return false;
     }
 
-    // Only optimize inner waypoints and times, fix boundary states
-    SplineTrajectory::OptimizationFlags flags;
-    flags.start_p = false;
-    flags.end_p = false;
-    flags.start_v = false;
-    flags.end_v = false;
-    flags.start_a = false;
-    flags.end_a = false;
-    splineOpt_.setOptimizationFlags(flags);
-    splineOpt_.setEnergyWeights(rho_energy_);
-    const auto integral_step_status = splineOpt_.setIntegralNumSteps(cps_num_prePiece_);
-    if (!integral_step_status)
-    {
-      ROS_ERROR_STREAM("SplineOptimizer step setup failed: " << integral_step_status.message);
-      return false;
-    }
-    splineOpt_.setRecordIntegralSamples(true, spline_workspace_);
+    splineOpt_.setRecordIntegralSamples(true, spline_context_);
 
     // Generate initial guess
-    Eigen::VectorXd x0 = splineOpt_.generateInitialGuess();
+    Eigen::VectorXd x0 = splineOpt_.generateInitialGuess(spline_context_);
     variable_num_ = x0.size();
 
     // Copy to raw array for LBFGS
@@ -166,7 +166,7 @@ namespace ego_planner
         if (!flag_swarm_too_close)
         {
           // Get optimized trajectory for collision check
-          const SplineTraj &opt_spline = splineOpt_.getWorkingSpline(spline_workspace_);
+          const SplineTraj &opt_spline = splineOpt_.getWorkingSpline(spline_context_);
           PPoly3D traj = opt_spline.getTrajectoryCopy();
           Eigen::VectorXd durs(piece_num_);
           for (int i = 0; i < piece_num_; ++i)

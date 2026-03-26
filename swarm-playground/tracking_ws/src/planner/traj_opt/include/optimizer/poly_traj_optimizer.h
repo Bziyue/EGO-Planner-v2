@@ -21,6 +21,7 @@ namespace ego_planner
 
     // SplineOptimizer replaces MinJerkOpt
     SplineOpt splineOpt_;
+    SplineOpt::OptimizationContext spline_context_;
 
     SwarmTrajData *swarm_trajs_{NULL};
     ConstraintPoints cps_;
@@ -94,6 +95,7 @@ namespace ego_planner
     /* helper functions */
     inline const ConstraintPoints &getControlPoints(void) { return cps_; }
     inline const SplineOpt &getSplineOpt(void) const { return splineOpt_; }
+    inline const SplineTraj &getWorkingSpline(void) const { return splineOpt_.getWorkingSpline(spline_context_); }
     inline int get_cps_num_prePiece_(void) { return cps_num_prePiece_; }
     inline double get_swarm_clearance_(void) { return swarm_clearance_; }
 

@@ -136,10 +136,15 @@ namespace ego_planner
 
     opt->integral_cost_func_.resetAccumulation();
 
-    double total_cost = opt->splineOpt_.evaluate(
-        x_vec, grad_vec,
-        opt->time_cost_func_,
-        opt->integral_cost_func_);
+    auto spec = SplineOpt::makeEvaluateSpec(opt->time_cost_func_, opt->integral_cost_func_);
+    const auto eval_result = opt->splineOpt_.evaluate(opt->spline_context_, x_vec, grad_vec, spec);
+    if (!eval_result)
+    {
+      Eigen::Map<Eigen::VectorXd>(grad, n).setZero();
+      opt->force_stop_type_ = STOP_FOR_ERROR;
+      return std::numeric_limits<double>::infinity();
+    }
+    double total_cost = eval_result.cost;
 
     // Distance variance cost on constraint points (post-processing).
     // Apply its gradient in the SAME iteration to keep L-BFGS consistent.
@@ -158,10 +163,20 @@ namespace ego_planner
 
       Eigen::VectorXd grad_var = Eigen::VectorXd::Zero(n);
       ZeroTimeCostFunction zero_time;
-      double rho_backup = opt->rho_energy_;
-      opt->splineOpt_.setEnergyWeights(0.0);
-      opt->splineOpt_.evaluate(x_vec, grad_var, zero_time, var_cost_func);
-      opt->splineOpt_.setEnergyWeights(rho_backup);
+      auto config = opt->splineOpt_.getActiveConfig();
+      const double rho_backup = config.rho_energy;
+      config.rho_energy = 0.0;
+      opt->splineOpt_.setConfig(config);
+      auto var_spec = SplineOpt::makeEvaluateSpec(zero_time, var_cost_func);
+      const auto var_eval = opt->splineOpt_.evaluate(opt->spline_context_, x_vec, grad_var, var_spec);
+      config.rho_energy = rho_backup;
+      opt->splineOpt_.setConfig(config);
+      if (!var_eval)
+      {
+        Eigen::Map<Eigen::VectorXd>(grad, n).setZero();
+        opt->force_stop_type_ = STOP_FOR_ERROR;
+        return std::numeric_limits<double>::infinity();
+      }
 
       grad_vec += grad_var;
     }

@@ -16,8 +16,7 @@ namespace ego_planner
     spec.time_cost = &time_cost_func_;
     spec.integral_cost = &integral_cost_func_;
     spec.sample_cost = &sample_cost_func_;
-    spec.workspace = &spline_workspace_;
-    return splineOpt_.evaluate(x, grad, spec);
+    return splineOpt_.evaluate(spline_context_, x, grad, spec);
   }
 
   // =====================================================
@@ -137,7 +136,7 @@ namespace ego_planner
       cps_.points.resize(3, cps_.cp_size);
     }
 
-    const auto &samples = splineOpt_.getRecordedIntegralSamples(spline_workspace_);
+    const auto &samples = splineOpt_.getRecordedIntegralSamples(spline_context_);
     for (const auto &sample : samples)
     {
       const int control_point_index = sample.seg_idx * cps_num_prePiece_ + sample.step_in_seg;
