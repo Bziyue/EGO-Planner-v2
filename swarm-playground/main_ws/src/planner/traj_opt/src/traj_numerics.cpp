@@ -9,13 +9,8 @@ namespace ego_planner
       const Eigen::VectorXd &x,
       Eigen::VectorXd &grad)
   {
-    SplineOpt::EvaluateSpec<TimeCostFunction,
-                            IntegralCostFunction,
-                            SplineTrajectory::VoidWaypointsCost,
-                            SampleCostFunction> spec;
-    spec.time_cost = &time_cost_func_;
-    spec.integral_cost = &integral_cost_func_;
-    spec.sample_cost = &sample_cost_func_;
+    const auto spec = SplineOpt::makeEvaluateSpec(time_cost_func_, integral_cost_func_)
+                          .withSampleCost(sample_cost_func_);
     return splineOpt_.evaluate(spline_context_, x, grad, spec);
   }
 

@@ -9,8 +9,9 @@ These are reference interfaces only:
 
 The current optimizer API also uses a few small integration types:
 
-- `Workspace`: caller-owned mutable state used during evaluation
-- `EvaluateSpec`: binds cost functors, executor, and workspace
+- `OptimizationContext`: caller-owned prepared problem plus mutable runtime state
+- `EvaluateSpec`: binds borrowed cost functors and an executor
+- `ErrorCode`: structured failure categories for setup and evaluation
 - `Status`: returned by setup/validation style APIs
 - `EvaluationResult`: returned by `evaluate(...)`
 - `GradientCheckResult`: returned by `checkGradients(...)`
@@ -18,9 +19,13 @@ The current optimizer API also uses a few small integration types:
 Typical flow:
 
 1. create and initialize a `SplineOptimizer`
-2. create one `Workspace` per evaluation context
+2. create one `OptimizationContext` per evaluation context
 3. build an `EvaluateSpec` with `makeEvaluateSpec(...)`
 4. call `evaluate(...)` and inspect `EvaluationResult::ok`
+
+`EvaluateSpec` borrows cost objects through reference-like storage, so cost
+functors passed to `makeEvaluateSpec(...)` and `with...Cost(...)` must be
+lvalues that outlive the spec.
 
 ## TimeMap Protocol
 
@@ -124,7 +129,7 @@ struct SampleCostProtocol
 
 - `seg_idx`: segment index
 - `step_in_seg`: sample step inside the segment
-- `global_sample_index`: index inside the recorded sample buffer
+- `sample_buffer_index`: index inside the recorded sample buffer
 - `alpha`: normalized time in the segment, in `[0, 1]`
 - `t_local`: local time within the segment
 - `t_global`: absolute time
@@ -132,6 +137,14 @@ struct SampleCostProtocol
 - `dt`: segment integration step size
 - `b_p`: position basis row for the spline coefficients
 - `p`, `v`: sampled position and velocity
+
+Under the current optimizer data model, `SampleCost` is a discrete cost on:
+
+- sampled position `p`
+- sampled global time `t_global`
+
+It does not currently expose independent sample-backward channels for
+`v/a/j/s`.
 
 ## TrajectoryCost Protocol
 
@@ -184,28 +197,111 @@ struct AuxiliaryStateMapProtocol
 
 ## Runtime Integration Notes
 
-`SplineOptimizer` no longer owns an internal workspace. Callers should provide one workspace per active evaluation context:
+`SplineOptimizer` no longer owns an internal prepared problem or runtime state.
+Callers should provide one `OptimizationContext` per active evaluation flow:
 
 ```cpp
 using Optimizer = SplineTrajectory::SplineOptimizer<3>;
 
 Optimizer optimizer;
-Optimizer::Workspace workspace;
+Optimizer::OptimizationContext context;
 
-auto spec = Optimizer::makeEvaluateSpec(time_cost, integral_cost, workspace);
-auto result = optimizer.evaluate(x, grad, spec);
+auto status = optimizer.prepareContext(problem, context);
+if (!status)
+{
+    std::cerr << status.message << std::endl;
+}
+
+auto spec = Optimizer::makeEvaluateSpec(time_cost, integral_cost);
+auto x = optimizer.generateInitialGuess(context);
+auto result = optimizer.evaluate(context, x, grad, spec);
 if (!result)
 {
     std::cerr << result.message << std::endl;
 }
 ```
 
+`prepareContext(...)` snapshots the config-dependent mapper and scalar state
+needed by later evaluation, including:
+
+- `TimeMap`
+- `SpatialMap`
+- `AuxiliaryStateMap`
+- `rho_energy`
+- `integral_num_steps`
+
+Later `setConfig(...)` calls affect newly prepared contexts, but do not mutate
+existing prepared contexts.
+
 Setup and validation style APIs use `Status`:
 
 ```cpp
-auto status = optimizer.setInitState(durations, waypoints, 0.0, bc);
+Optimizer::OptimizerConfig config;
+config.rho_energy = 0.05;
+config.integral_num_steps = 32;
+optimizer.setConfig(config);
+
+Optimizer::ProblemDefinition problem;
+problem.time_segments = durations;
+problem.waypoints = waypoints;
+problem.start_time = 0.0;
+problem.bc = bc;
+
+Optimizer::OptimizationContext context;
+auto status = optimizer.prepareContext(problem, context);
 if (!status)
 {
+    std::cerr << static_cast<int>(status.code) << std::endl;
     std::cerr << status.message << std::endl;
 }
 ```
+
+If you want an explicit mask for just this problem, attach it directly to the
+problem definition before preparing the context:
+
+```cpp
+Optimizer::OptimizationMask mask;
+mask.time.assign(durations.size(), static_cast<uint8_t>(1));
+mask.waypoints.assign(durations.size() + 1, static_cast<uint8_t>(1));
+mask.waypoints.front() = static_cast<uint8_t>(0);
+mask.waypoints.back() = static_cast<uint8_t>(0);
+
+problem.mask = mask;
+
+auto status = optimizer.prepareContext(problem, context);
+```
+
+If your upstream pipeline provides absolute time points instead of durations,
+build the problem with the helper and still use the same `prepareContext(...)`
+entrypoint:
+
+```cpp
+std::vector<double> time_points = {0.0, 1.2, 2.7, 4.0};
+auto problem = Optimizer::makeProblemFromTimePoints(time_points, waypoints, bc);
+auto status = optimizer.prepareContext(problem, context);
+```
+
+Evaluation uses `EvaluationResult` with the same error code pattern:
+
+```cpp
+auto result = optimizer.evaluate(context, x, grad, spec);
+if (!result)
+{
+    std::cerr << static_cast<int>(result.code) << std::endl;
+    std::cerr << result.message << std::endl;
+}
+```
+
+Optional costs and a custom executor can be attached fluently:
+
+```cpp
+auto spec = Optimizer::makeEvaluateSpec(time_cost, integral_cost)
+                .withWaypointsCost(waypoints_cost)
+                .withSampleCost(sample_cost)
+                .withTrajectoryCost(trajectory_cost)
+                .withExecutor(OpenMPExecutor{});
+```
+
+When using `OpenMPExecutor`, the borrowed `integral_cost` object must be
+thread-safe because the same functor instance is invoked concurrently across
+segments.
