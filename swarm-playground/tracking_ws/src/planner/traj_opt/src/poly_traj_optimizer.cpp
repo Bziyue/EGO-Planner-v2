@@ -102,7 +102,6 @@ namespace ego_planner
     integral_cost_func_.drone_id = drone_id_;
     integral_cost_func_.t_now = t_now_;
     integral_cost_func_.touch_goal = touch_goal_;
-    integral_cost_func_.cps_per_piece = cps_num_prePiece_;
     integral_cost_func_.min_ellip_dist2_ptr = &min_ellip_dist2_;
     integral_cost_func_.wei_tracking = wei_tracking_;
     integral_cost_func_.relative_tracking_p = relative_tracking_p_;

@@ -16,19 +16,19 @@ public:
   Eigen::Quaterniond object_q{1.0, 0.0, 0.0, 0.0};
   bool start_tracking{false};
 
-  double operator()(double t, double t_global, int seg_idx, int step_in_seg,
+  double operator()(const SplineTrajectory::IntegralPointInfo &point,
                     const Types::Vec3 &p, const Types::Vec3 &v,
                     const Types::Vec3 &a, const Types::Vec3 &j, const Types::Vec3 &s,
                     Types::Vec3 &gp, Types::Vec3 &gv, Types::Vec3 &ga,
                     Types::Vec3 &gj, Types::Vec3 &gs, double &gt) const
   {
-    const double base_cost = EgoIntegralCostAdapter::operator()(t, t_global, seg_idx, step_in_seg, p, v, a, j, s, gp, gv, ga, gj, gs, gt);
-    if (!start_tracking || !cps || seg_idx < 0)
+    const double base_cost = EgoIntegralCostAdapter::operator()(point, p, v, a, j, s, gp, gv, ga, gj, gs, gt);
+    if (!start_tracking || !cps || point.segment_index < 0)
     {
       return base_cost;
     }
 
-    const int cp_idx = seg_idx * cps_per_piece + step_in_seg;
+    const int cp_idx = point.segment_index * point.step_count + point.step_index;
     if (cp_idx <= 0 || cp_idx > Types::ConstraintPoints::two_thirds_id(cps->points, touch_goal))
     {
       return base_cost;
@@ -38,7 +38,7 @@ public:
       return base_cost;
     }
 
-    const Types::Vec3 object_p_t = object_p + object_v * t + object_q.matrix() * relative_tracking_p;
+    const Types::Vec3 object_p_t = object_p + object_v * point.local_time + object_q.matrix() * relative_tracking_p;
     const Types::Vec3 dJ_dp = 2.0 * (p - object_p_t);
     const double tracking_cost = wei_tracking * 0.25 * dJ_dp.squaredNorm();
     gp += wei_tracking * dJ_dp;
