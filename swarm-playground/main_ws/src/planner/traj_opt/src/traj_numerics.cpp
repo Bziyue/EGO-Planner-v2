@@ -89,9 +89,7 @@ namespace ego_planner
     fill(opt->min_ellip_dist2_.begin(), opt->min_ellip_dist2_.end(), std::numeric_limits<double>::max());
 
     Eigen::VectorXd x_vec = Eigen::Map<const Eigen::VectorXd>(x, n);
-    Eigen::VectorXd grad_vec = Eigen::VectorXd::Zero(n);
-
-    opt->integral_cost_func_.resetAccumulation();
+    Eigen::VectorXd grad_vec(n);
 
     const auto eval_result = opt->evaluateCurrentDecisionVariables(x_vec, grad_vec);
     if (!eval_result)
@@ -134,7 +132,8 @@ namespace ego_planner
     const auto &samples = splineOpt_.getRecordedIntegralSamples(spline_context_);
     for (const auto &sample : samples)
     {
-      const int control_point_index = sample.seg_idx * cps_num_prePiece_ + sample.step_in_seg;
+      const int control_point_index =
+          sample.point.segment_index * cps_num_prePiece_ + sample.point.step_index;
       if (control_point_index >= 0 && control_point_index < cps_.cp_size)
       {
         cps_.points.col(control_point_index) = sample.p;

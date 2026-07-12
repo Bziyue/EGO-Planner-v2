@@ -15,19 +15,19 @@ public:
   Types::Vec3 formation_start{Types::Vec3::Zero()};
   Types::Vec3 formation_end{Types::Vec3::Zero()};
 
-  double operator()(double t, double t_global, int seg_idx, int step_in_seg,
+  double operator()(const SplineTrajectory::IntegralPointInfo &point,
                     const Types::Vec3 &p, const Types::Vec3 &v,
                     const Types::Vec3 &a, const Types::Vec3 &j, const Types::Vec3 &s,
                     Types::Vec3 &gp, Types::Vec3 &gv, Types::Vec3 &ga,
                     Types::Vec3 &gj, Types::Vec3 &gs, double &gt) const
   {
-    const double base_cost = EgoIntegralCostAdapter::operator()(t, t_global, seg_idx, step_in_seg, p, v, a, j, s, gp, gv, ga, gj, gs, gt);
-    if (!cps || seg_idx < 0)
+    const double base_cost = EgoIntegralCostAdapter::operator()(point, p, v, a, j, s, gp, gv, ga, gj, gs, gt);
+    if (!cps || point.segment_index < 0)
     {
       return base_cost;
     }
 
-    const int cp_idx = seg_idx * cps_per_piece + step_in_seg;
+    const int cp_idx = point.segment_index * point.step_count + point.step_index;
     if (cp_idx <= 0 || cp_idx > Types::ConstraintPoints::two_thirds_id(cps->points, touch_goal))
     {
       return base_cost;
@@ -48,7 +48,7 @@ public:
     }
 
     const Types::Vec3 axis = direction.normalized();
-    const double pt_time = t_now + t;
+    const double pt_time = t_now + point.local_time;
 
     double l = 0.0;
     double dl_dt = 0.0;

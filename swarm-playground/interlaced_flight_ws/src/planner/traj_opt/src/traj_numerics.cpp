@@ -19,24 +19,19 @@ namespace ego_planner
   {
   public:
     const Eigen::MatrixXd *variance_grad{nullptr};
-    const std::vector<double> *segment_dt{nullptr};
-    int cps_per_piece{1};
 
-    double operator()(double /*t*/, double /*t_global*/, int seg_idx, int step_in_seg,
+    double operator()(const SplineTrajectory::IntegralPointInfo &point,
                       const Vec3 & /*p*/, const Vec3 & /*v*/,
                       const Vec3 & /*a*/, const Vec3 & /*j*/, const Vec3 & /*s*/,
                       Vec3 &gp, Vec3 & /*gv*/, Vec3 & /*ga*/,
                       Vec3 & /*gj*/, Vec3 & /*gs*/, double & /*gt*/) const
     {
-      int cp_idx = seg_idx * cps_per_piece + step_in_seg;
-      if (variance_grad && segment_dt &&
-          cp_idx < variance_grad->cols() &&
-          seg_idx >= 0 && seg_idx < (int)segment_dt->size())
+      const int cp_idx = point.segment_index * point.step_count + point.step_index;
+      if (variance_grad && cp_idx < variance_grad->cols())
       {
-        double dt = (*segment_dt)[seg_idx];
-        if (dt > 1e-12)
+        if (point.step_size > 1e-12)
         {
-          gp += variance_grad->col(cp_idx) / dt;
+          gp += variance_grad->col(cp_idx) / point.step_size;
         }
       }
 
@@ -119,22 +114,7 @@ namespace ego_planner
     fill(opt->min_ellip_dist2_.begin(), opt->min_ellip_dist2_.end(), std::numeric_limits<double>::max());
 
     Eigen::VectorXd x_vec = Eigen::Map<const Eigen::VectorXd>(x, n);
-    Eigen::VectorXd grad_vec = Eigen::VectorXd::Zero(n);
-
-    // Pre-compute segment dt for variance gradient scaling.
-    // x layout: [tau_0, ..., tau_{N-1}, P_inner, ...]
-    // T_i = QuadInvTimeMap::toTime(tau_i), dt_i = T_i / K
-    {
-      SplineTrajectory::QuadInvTimeMap time_map;
-      opt->integral_cost_func_.segment_dt_.resize(opt->piece_num_);
-      for (int i = 0; i < opt->piece_num_; ++i)
-      {
-        double T = time_map.toTime(x_vec(i));
-        opt->integral_cost_func_.segment_dt_[i] = T / opt->cps_num_prePiece_;
-      }
-    }
-
-    opt->integral_cost_func_.resetAccumulation();
+    Eigen::VectorXd grad_vec(n);
 
     auto spec = SplineOpt::makeEvaluateSpec(opt->time_cost_func_, opt->integral_cost_func_);
     const auto eval_result = opt->splineOpt_.evaluate(opt->spline_context_, x_vec, grad_vec, spec);
@@ -158,8 +138,6 @@ namespace ego_planner
       // Inject discrete variance gradient via a second pass (no time/energy cost).
       VarianceGradCostFunction var_cost_func;
       var_cost_func.variance_grad = &gdp;
-      var_cost_func.segment_dt = &opt->integral_cost_func_.segment_dt_;
-      var_cost_func.cps_per_piece = opt->cps_num_prePiece_;
 
       Eigen::VectorXd grad_var = Eigen::VectorXd::Zero(n);
       ZeroTimeCostFunction zero_time;
